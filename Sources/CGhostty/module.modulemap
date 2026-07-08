@@ -1,0 +1,14 @@
+// CGhostty — Clang module map exposing Ghostty's headless terminal core
+// (libghostty-vt) to Swift as the `CGhostty` module.
+//
+// `ghostty_shim.h` includes the real <ghostty/vt.h>. The header is resolved from
+// vendor/libghostty/include via `-Xcc -I…` and the static archive is linked via
+// the `link "ghostty-vt"` directive (emits -lghostty-vt) together with
+// `-Xlinker -Lvendor/libghostty/lib`. See scripts/build-deps.sh and
+// docs/INTEGRATION.md §1 for the full build/link invocation.
+
+module CGhostty {
+    header "ghostty_shim.h"
+    link "ghostty-vt"
+    export *
+}

@@ -1,0 +1,23 @@
+# SwiftPM build + resolved deps
+.build/
+.swiftpm/xcode/**/xcuserdata/
+*.xcuserstate
+
+# Vendored Ghostty SOURCE clone (~180 MB) — regenerate with scripts/build-deps.sh.
+# The BUILT libghostty-vt (vendor/libghostty/) IS committed so worktrees build
+# without re-running zig.
+vendor/ghostty/
+
+# Built wavesrv backend (~24 MB) — regenerate with scripts/build-deps.sh; the app
+# and e2e harness locate it via $WAVE_NATIVE_WAVESRV.
+bin/
+
+# Misc caches
+.npm-cache/
+.DS_Store
+
+# Packaged .app bundle (rebuild with scripts/bundle-app.sh)
+dist/
+
+# Agent worktrees / local agent state
+.claude/
