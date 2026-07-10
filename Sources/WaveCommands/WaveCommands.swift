@@ -283,6 +283,19 @@ public final class WaveCommands: Sendable {
         return claimable
     }
 
+    /// `[svc] WorkspaceService.SaveWorkspaceLayout(workspaceId)`
+    /// (`workspaceservice.go`). Snapshots the workspace's tabs + panes into its own meta.
+    public func saveWorkspaceLayout(_ workspaceId: String) async throws {
+        try await callService("workspace", "SaveWorkspaceLayout", args: [.string(workspaceId)])
+    }
+
+    /// `[svc] WorkspaceService.RestoreWorkspaceLayout(workspaceId)`
+    /// (`workspaceservice.go`). Rebuilds the workspace to its saved snapshot (wipe &
+    /// recreate), force-closing tabs/panes that drifted from the snapshot.
+    public func restoreWorkspaceLayout(_ workspaceId: String) async throws {
+        try await callService("workspace", "RestoreWorkspaceLayout", args: [.string(workspaceId)])
+    }
+
     // MARK: - Tab (PROTOCOL.md §3 "Tab")
 
     /// `[svc] WorkspaceService.CreateTab(workspaceId, tabName, activateTab)`

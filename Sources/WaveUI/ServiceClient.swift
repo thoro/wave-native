@@ -164,6 +164,26 @@ final class ServiceClient: Sendable {
         ))
     }
 
+    /// `workspace.SaveWorkspaceLayout(workspaceId)` — snapshot the workspace's current
+    /// tabs + panes into its own meta (`Workspace.Meta["workspace:savedlayout"]`). The
+    /// backend broadcasts the workspace update (applied by `call`).
+    func saveWorkspaceLayout(workspaceId: String) async throws {
+        try await call(WebCallType(
+            service: WaveService.workspace, method: "SaveWorkspaceLayout",
+            args: [.string(workspaceId)]
+        ))
+    }
+
+    /// `workspace.RestoreWorkspaceLayout(workspaceId)` — rebuild the workspace to its
+    /// saved snapshot (wipe & recreate), force-closing drifted tabs/panes. The backend
+    /// broadcasts the resulting object updates (applied by `call`).
+    func restoreWorkspaceLayout(workspaceId: String) async throws {
+        try await call(WebCallType(
+            service: WaveService.workspace, method: "RestoreWorkspaceLayout",
+            args: [.string(workspaceId)]
+        ))
+    }
+
     /// `workspace.GetColors()` — the 7 selectable workspace hex colors
     /// (`wcore.WorkspaceColors`). Static data; callers cache the result.
     func getColors() async throws -> [String] {

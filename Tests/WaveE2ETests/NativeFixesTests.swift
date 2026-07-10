@@ -280,6 +280,20 @@ final class NativeFixesTests: XCTestCase {
                        "Cmd-W must close the focused block (terminal or web)")
     }
 
+    // MARK: - Web pane ⌘ preemption: history keys stay with the page
+
+    func testWebHistoryKeysExcludedFromPreempt() {
+        XCTAssertTrue(WaveWindowController.isWebHistoryKey(scalar: UInt32(NSLeftArrowFunctionKey)),
+                      "⌘← must stay with a focused web page (history back), not switch tabs")
+        XCTAssertTrue(WaveWindowController.isWebHistoryKey(scalar: UInt32(NSRightArrowFunctionKey)),
+                      "⌘→ must stay with a focused web page (history forward), not switch tabs")
+        XCTAssertFalse(WaveWindowController.isWebHistoryKey(scalar: UInt32(UnicodeScalar("d").value)),
+                       "⌘D is an app-global (split) — preempted from a web pane")
+        XCTAssertFalse(WaveWindowController.isWebHistoryKey(scalar: UInt32(UnicodeScalar("[").value)),
+                       "⌘[ stays tab switching, matching non-web panes")
+        XCTAssertFalse(WaveWindowController.isWebHistoryKey(scalar: nil))
+    }
+
     // MARK: - Bug 3: workspace dropdown selection fires the focus-or-open seam
 
     func testWorkspaceDropdownSelectionFiresOnSelect() {
@@ -484,6 +498,108 @@ final class NativeFixesTests: XCTestCase {
         XCTAssertTrue(issued, "delete must issue DeleteWorkspace")
         let call = try XCTUnwrap(t.recordedServiceArgs().first { $0.method == "DeleteWorkspace" })
         XCTAssertEqual(call.args, [.string("ws-1")])
+    }
+
+    // MARK: - Feature: workspace layout save / restore
+    // (left-click switcher button opens the viewer; right-click opens Save/Reset for the
+    //  ACTIVE workspace)
+
+    func testLayoutMenuBuildsBothItemsResetDisabledWithoutSnapshot() {
+        let menu = WorkspaceSwitcherView.makeLayoutMenu(hasSavedLayout: false, onSave: {}, onReset: {})
+        XCTAssertEqual(menu.items.map(\.title), ["Save Layout", "Reset to Saved Layout"])
+        XCTAssertTrue(menu.items[0].isEnabled, "Save Layout is always available")
+        XCTAssertFalse(menu.items[1].isEnabled, "Reset must be disabled without a snapshot")
+    }
+
+    func testLayoutMenuResetEnabledWithSnapshot() {
+        let menu = WorkspaceSwitcherView.makeLayoutMenu(hasSavedLayout: true, onSave: {}, onReset: {})
+        XCTAssertTrue(menu.items[1].isEnabled, "Reset must be enabled when a snapshot exists")
+    }
+
+    func testLayoutMenuActionsFireCallbacks() throws {
+        var saved = false
+        var reset = false
+        let menu = WorkspaceSwitcherView.makeLayoutMenu(
+            hasSavedLayout: true, onSave: { saved = true }, onReset: { reset = true })
+        try XCTUnwrap(menu.items[0] as? ClosureMenuItem).performAction()
+        try XCTUnwrap(menu.items[1] as? ClosureMenuItem).performAction()
+        XCTAssertTrue(saved)
+        XCTAssertTrue(reset)
+    }
+
+    @MainActor
+    func testSwitcherRightClickMenuTargetsActiveWorkspace() throws {
+        let switcher = WorkspaceSwitcherView(frame: .zero)
+        var savedId: String?
+        var resetId: String?
+        switcher.onSaveWorkspaceLayout = { savedId = $0 }
+        switcher.onResetWorkspaceLayout = { resetId = $0 }
+        switcher.setActive(name: "Alpha", icon: "star", color: nil, workspaceId: "w7")
+        switcher.setItems([
+            WorkspaceMenuItem(workspaceId: "w7", name: "Alpha", icon: "star", color: nil,
+                              isCurrent: true, hasSavedLayout: true),
+        ])
+        let menu = try XCTUnwrap(switcher.layoutMenuForActiveWorkspace())
+        XCTAssertTrue(menu.items[1].isEnabled, "active workspace has a snapshot → Reset enabled")
+        try XCTUnwrap(menu.items[0] as? ClosureMenuItem).performAction()
+        try XCTUnwrap(menu.items[1] as? ClosureMenuItem).performAction()
+        XCTAssertEqual(savedId, "w7", "Save must target the active workspace")
+        XCTAssertEqual(resetId, "w7", "Reset must target the active workspace")
+    }
+
+    @MainActor
+    func testSwitcherRightClickMenuNilWithoutActiveWorkspace() {
+        let switcher = WorkspaceSwitcherView(frame: .zero)
+        XCTAssertNil(switcher.layoutMenuForActiveWorkspace(),
+                     "no active workspace → no layout menu (right-click falls through)")
+    }
+
+    func testSaveWorkspaceLayoutIssuesServiceCall() async throws {
+        let (t, s) = makeWorld(tabCount: 1)
+        let coordinator = AppCoordinator(transport: t, store: s)
+        coordinator.saveWorkspaceLayout("ws-1")
+        let issued = await waitUntil(timeout: 2) {
+            t.recordedServiceArgs().contains { $0.method == "SaveWorkspaceLayout" }
+        }
+        XCTAssertTrue(issued, "save layout must issue SaveWorkspaceLayout")
+        let call = try XCTUnwrap(t.recordedServiceArgs().first { $0.method == "SaveWorkspaceLayout" })
+        XCTAssertEqual(call.args, [.string("ws-1")])
+    }
+
+    func testRestoreWorkspaceLayoutIssuesServiceCall() async throws {
+        let (t, s) = makeWorld(tabCount: 1)
+        let coordinator = AppCoordinator(transport: t, store: s)
+        coordinator.restoreWorkspaceLayout("ws-1")
+        let issued = await waitUntil(timeout: 2) {
+            t.recordedServiceArgs().contains { $0.method == "RestoreWorkspaceLayout" }
+        }
+        XCTAssertTrue(issued, "reset layout must issue RestoreWorkspaceLayout")
+        let call = try XCTUnwrap(t.recordedServiceArgs().first { $0.method == "RestoreWorkspaceLayout" })
+        XCTAssertEqual(call.args, [.string("ws-1")])
+    }
+
+    func testRefreshWorkspaceListSetsHasSavedLayoutFromMeta() async throws {
+        let (t, s) = makeWorld(tabCount: 1)
+        // ws-1 carries a saved-layout snapshot; ws-2 does not.
+        s.preload(.workspace(Workspace(oid: "ws-1", version: 1, name: "Default",
+                                       tabids: ["tab-1"], activetabid: "tab-1",
+                                       meta: [WorkspaceMenuItem.savedLayoutMetaKey: .bool(true)])))
+        s.preload(.workspace(Workspace(oid: "ws-2", version: 1, name: "Other",
+                                       tabids: [], activetabid: "", meta: [:])))
+        t.workspaceListResponse = try JSONValue.encode([
+            WorkspaceListEntry(workspaceid: "ws-1", windowid: "win-1"),
+            WorkspaceListEntry(workspaceid: "ws-2", windowid: ""),
+        ])
+        let coordinator = AppCoordinator(transport: t, store: s)
+        let delegate = WorkspaceListDelegate()
+        coordinator.delegate = delegate
+        coordinator.start()
+        await fulfillment(of: [delegate.ready], timeout: 2)
+
+        let withSnapshot = try XCTUnwrap(delegate.lastList.first { $0.workspaceId == "ws-1" })
+        let without = try XCTUnwrap(delegate.lastList.first { $0.workspaceId == "ws-2" })
+        XCTAssertTrue(withSnapshot.hasSavedLayout, "ws-1 has a saved-layout meta key")
+        XCTAssertFalse(without.hasSavedLayout, "ws-2 has no saved-layout meta key")
     }
 
     // MARK: - Feature 3: color + icon picker

@@ -90,6 +90,19 @@ public final class TestDriver {
             return
         }
         guard let window = keyWindow() else { return }
+        if verb == "resp" {
+            // Diagnostics: dump the firstResponder and its superview chain, so focus
+            // bookkeeping can be verified without guessing from screenshots.
+            var lines: [String] = ["firstResponder=\(String(describing: window.firstResponder))"]
+            var v = window.firstResponder as? NSView
+            while let cur = v {
+                lines.append("\(type(of: cur)) frame=\(cur.frame)")
+                v = cur.superview
+            }
+            try? lines.joined(separator: "\n").write(
+                toFile: arg.trimmingCharacters(in: .whitespaces), atomically: true, encoding: .utf8)
+            return
+        }
 
         switch verb {
         case "type":
@@ -127,6 +140,15 @@ public final class TestDriver {
             }
             try? chain.joined(separator: "\n").write(
                 toFile: String(parts[2]), atomically: true, encoding: .utf8)
+        case "perfclick":
+            // Programmatic click for NSControl targets (widget-bar buttons): a
+            // synthesized mouseDown enters NSButton's tracking loop, which wedges on
+            // driver events; performClick fires the action directly.
+            let p = points(arg, window)
+            if let loc = p.first, let content = window.contentView,
+               let control = content.hitTest(hitPoint(loc, content)) as? NSControl {
+                control.performClick(nil)
+            }
         case "dblclick":
             let p = points(arg, window)
             if p.count >= 1 {
@@ -148,6 +170,8 @@ public final class TestDriver {
             }
         case "shiftkey":
             sendNamed(arg, window: window, flags: .shift)
+        case "cmdoptkey":
+            sendNamed(arg, window: window, flags: [.command, .option])
         case "optkey":
             sendNamed(arg, window: window, flags: .option)
         case "drag":

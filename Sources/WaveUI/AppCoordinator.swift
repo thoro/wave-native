@@ -1179,6 +1179,34 @@ public final class AppCoordinator {
         }
     }
 
+    /// "Save Layout" (switcher row context menu): snapshot the workspace's current tabs +
+    /// panes into its own meta. Refresh the list so the row's "Reset to Saved Layout"
+    /// action becomes enabled immediately.
+    public func saveWorkspaceLayout(_ id: String) {
+        Task {
+            do {
+                try await self.service.saveWorkspaceLayout(workspaceId: id)
+                await self.refreshWorkspaceList()
+            } catch {
+                self.delegate?.coordinatorDidFail(error)
+            }
+        }
+    }
+
+    /// "Reset to Saved Layout" (switcher row context menu): rebuild the workspace to its
+    /// saved snapshot, force-closing drifted tabs/panes. The backend broadcasts the object
+    /// updates; refresh so the switcher reflects the rebuilt tab set.
+    public func restoreWorkspaceLayout(_ id: String) {
+        Task {
+            do {
+                try await self.service.restoreWorkspaceLayout(workspaceId: id)
+                await self.refreshWorkspaceList()
+            } catch {
+                self.delegate?.coordinatorDidFail(error)
+            }
+        }
+    }
+
     private func updateWorkspace(_ id: String, name: String, icon: String, color: String, applyDefaults: Bool) {
         Task {
             do {
@@ -1518,7 +1546,8 @@ public final class AppCoordinator {
                 name: (ws?.name?.isEmpty == false ? ws!.name! : "Workspace"),
                 icon: ws?.icon, color: ws?.color,
                 isOpen: openWorkspaceIds.contains(entry.workspaceid),
-                isCurrent: entry.workspaceid == workspaceId
+                isCurrent: entry.workspaceid == workspaceId,
+                hasSavedLayout: (ws?.meta[WorkspaceMenuItem.savedLayoutMetaKey] ?? nil) != nil
             )
         }
         delegate?.coordinatorDidUpdateWorkspaceList(items)

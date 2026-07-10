@@ -18,6 +18,34 @@ import AppKit
 import WebKit
 import WaveCore
 
+/// WKWebView that claims the window's firstResponder on ANY click into the page.
+/// WebKit only takes the firstResponder itself for some clicks (notably NOT for
+/// clicks landing on editable content), which left pane keyboard focus — and the
+/// focus-follows-responder bookkeeping observing it — behind. Claiming before
+/// super keeps the click's normal page behavior (DOM focus, selection) intact.
+private final class FocusForwardingWebView: WKWebView {
+    override func mouseDown(with event: NSEvent) {
+        claimFirstResponder()
+        super.mouseDown(with: event)
+    }
+
+    override func rightMouseDown(with event: NSEvent) {
+        claimFirstResponder()
+        super.rightMouseDown(with: event)
+    }
+
+    override func otherMouseDown(with event: NSEvent) {
+        claimFirstResponder()
+        super.otherMouseDown(with: event)
+    }
+
+    private func claimFirstResponder() {
+        guard let window else { return }
+        if (window.firstResponder as? NSView)?.isDescendant(of: self) == true { return }
+        window.makeFirstResponder(self)
+    }
+}
+
 /// The content view for a web block: a single WKWebView bound to block meta via
 /// `WebBlockModel`. The navigation chrome (URL bar, back/forward) lives in the
 /// block header (WaveUI); this view exposes the corresponding actions and the
@@ -80,7 +108,7 @@ public final class WebBlockView: NSView, WKNavigationDelegate, WKUIDelegate {
         // `web:useragenttype` still fully overrides this via `customUserAgent` below.
         config.applicationNameForUserAgent = WebUserAgent.desktopAppName
 
-        let newWebView = WKWebView(frame: bounds, configuration: config)
+        let newWebView = FocusForwardingWebView(frame: bounds, configuration: config)
         newWebView.navigationDelegate = self
         newWebView.uiDelegate = self
         newWebView.autoresizingMask = [.width, .height]
@@ -172,15 +200,21 @@ public final class WebBlockView: NSView, WKNavigationDelegate, WKUIDelegate {
     /// terminal (which accepts first responder).
     public override var acceptsFirstResponder: Bool { true }
 
-    /// Raised when this pane gains focus, so the owner moves the green border to it.
-    /// Wired by the composition root via `BlockEnv.onRequestFocus`.
-    public var onFocusRequest: (() -> Void)?
-
     /// Give keyboard focus to the page (`webview.tsx:giveFocus`).
+    ///
+    /// The hand-off to the inner WKWebView must be DEFERRED: becomeFirstResponder runs
+    /// INSIDE the window's makeFirstResponder(self), which finishes by setting
+    /// firstResponder back to self — a re-entrant makeFirstResponder(webView) here gets
+    /// clobbered, stranding keyboard focus on this inert container so the page never
+    /// receives keys. The async hop forwards after the outer call completes; the
+    /// responder check skips it if focus has already moved elsewhere meanwhile.
     @discardableResult
     public override func becomeFirstResponder() -> Bool {
-        onFocusRequest?()
-        return window?.makeFirstResponder(webView) ?? false
+        DispatchQueue.main.async { [weak self] in
+            guard let self, let window = self.window, window.firstResponder === self else { return }
+            window.makeFirstResponder(self.webView)
+        }
+        return true
     }
 
     // MARK: - WKNavigationDelegate (GUARDS §W: persist on finish)

@@ -1034,12 +1034,40 @@ final class BlockFrameView: NSView {
         NSApp.sendAction(selector, to: nil, from: contentView)
     }
 
+    /// Whether the block's content view has mounted (it streams in async via
+    /// `bindStore`). While false, `focusContent()` is a no-op and the owner must
+    /// re-focus on mount (LayoutTreeView's `pendingFocusBlockId`).
+    var hasMountedContent: Bool { contentView != nil }
+
+    /// Whether `responder` sits inside this block's mounted WEB content (the
+    /// WKWebView subtree) — the one responder that claims every ⌘ key equivalent
+    /// for the page. The header's URL field is NOT page content: it edits in the
+    /// window field editor, which lives beside the header text field, so header
+    /// editing keeps normal key routing.
+    func ownsWebPageResponder(_ responder: NSView) -> Bool {
+        guard currentViewType == "web", let contentView else { return false }
+        return responder.isDescendant(of: contentView)
+    }
+
     /// Make this block's content the window firstResponder so the user can type
     /// without clicking. No-op until content has mounted (it streams in async via
     /// `bindStore`); fresh tabs rely on the content view's own
     /// `viewDidMoveToWindow` for first focus instead.
     func focusContent() {
         guard let contentView, let window else { return }
+        // A web pane's content view never STAYS firstResponder — its
+        // becomeFirstResponder hands responder status to the inner WKWebView. So
+        // compare by descent, not identity: without this guard every re-focus
+        // re-runs the full responder dance, whose focus-request echo
+        // (becomeFirstResponder → onRequestFocus → focusBlock → here) livelocked
+        // the main thread at 100% CPU when a web pane was added. Only PROPER
+        // descendants are skipped — makeFirstResponder on the contentView itself is
+        // already idempotent (AppKit early-returns), and re-asserting it lets a pane
+        // whose deferred inner hand-off hasn't landed yet recover.
+        if let responder = window.firstResponder as? NSView, responder !== contentView,
+           responder.isDescendant(of: contentView) {
+            return
+        }
         window.makeFirstResponder(contentView)
     }
 

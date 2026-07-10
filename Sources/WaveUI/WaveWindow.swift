@@ -76,6 +76,13 @@ final class WaveWindow: NSWindow {
     /// keeps its Cmd-C/V/D/M and a rename field keeps its edit keys.
     var onKeyEquivalent: ((NSEvent) -> Bool)?
 
+    /// Consulted BEFORE the responder chain, for the few shortcuts that must never
+    /// be swallowed by the focused view: a focused WKWebView claims every ⌘-key
+    /// equivalent (it forwards them to the page and returns true), which would trap
+    /// ⌘⌥-arrow pane navigation inside a web pane. The handler must consume ONLY
+    /// such shortcuts; everything else keeps the "block declines first" ordering.
+    var onPreemptKeyEquivalent: ((NSEvent) -> Bool)?
+
     init(contentRect: NSRect) {
         super.init(
             contentRect: contentRect,
@@ -134,6 +141,7 @@ final class WaveWindow: NSWindow {
     }
 
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        if onPreemptKeyEquivalent?(event) == true { return true }
         if super.performKeyEquivalent(with: event) { return true }
         return onKeyEquivalent?(event) ?? false
     }

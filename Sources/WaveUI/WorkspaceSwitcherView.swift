@@ -12,6 +12,10 @@ import WaveCore
 
 /// One row in the dropdown.
 public struct WorkspaceMenuItem: Equatable, Sendable {
+    /// `Workspace.Meta` key under which a workspace stores its self-snapshot (mirrors Go
+    /// `waveobj.MetaKey_WorkspaceSavedLayout`). Presence of this key => `hasSavedLayout`.
+    public static let savedLayoutMetaKey = "workspace:savedlayout"
+
     public let workspaceId: String
     public let name: String
     public let icon: String?
@@ -22,14 +26,18 @@ public struct WorkspaceMenuItem: Equatable, Sendable {
     /// This workspace is the one shown in THIS window. Drives the checkmark badge
     /// (Electron `workspaceswitcher.tsx`: `isCurrentWorkspace ? "check" : "window"`).
     public let isCurrent: Bool
+    /// A layout snapshot has been saved for this workspace — enables "Reset to Saved
+    /// Layout" in the row's right-click menu.
+    public let hasSavedLayout: Bool
     public init(workspaceId: String, name: String, icon: String?, color: String?,
-                isOpen: Bool = false, isCurrent: Bool = false) {
+                isOpen: Bool = false, isCurrent: Bool = false, hasSavedLayout: Bool = false) {
         self.workspaceId = workspaceId
         self.name = name
         self.icon = icon
         self.color = color
         self.isOpen = isOpen
         self.isCurrent = isCurrent
+        self.hasSavedLayout = hasSavedLayout
     }
 }
 
@@ -48,6 +56,10 @@ final class WorkspaceSwitcherView: NSView {
     var onSaveWorkspace: ((String) -> Void)?
     /// Editor "Delete workspace" (after confirmation). Carries the workspaceId.
     var onDeleteWorkspace: ((String) -> Void)?
+    /// Row right-click "Save Layout": snapshot this workspace's tabs/panes. Carries the workspaceId.
+    var onSaveWorkspaceLayout: ((String) -> Void)?
+    /// Row right-click "Reset to Saved Layout": rebuild this workspace to its snapshot. Carries the workspaceId.
+    var onResetWorkspaceLayout: ((String) -> Void)?
 
     private let button = NonDragView()
     private let iconView = NSImageView()
@@ -189,6 +201,45 @@ final class WorkspaceSwitcherView: NSView {
 
     override func mouseDown(with event: NSEvent) {
         toggleDropdown()
+    }
+
+    /// Right-click on the switcher button opens the layout menu (Save / Reset) for the
+    /// ACTIVE workspace — left-click opens the workspace viewer (dropdown). The button's
+    /// subviews (label/icon/container) don't consume mouse events, so an unhandled
+    /// right-click bubbles here.
+    override func rightMouseDown(with event: NSEvent) {
+        guard let menu = layoutMenuForActiveWorkspace() else {
+            super.rightMouseDown(with: event)
+            return
+        }
+        NSMenu.popUpContextMenu(menu, with: event, for: self)
+    }
+
+    /// The active workspace's right-click layout menu, or nil when there is no active
+    /// workspace. "Reset to Saved Layout" is enabled only when the active workspace has a
+    /// snapshot (looked up from the current items). Exposed for unit tests.
+    func layoutMenuForActiveWorkspace() -> NSMenu? {
+        guard let workspaceId = activeWorkspaceId else { return nil }
+        let hasSaved = items.first { $0.workspaceId == workspaceId }?.hasSavedLayout ?? false
+        return Self.makeLayoutMenu(
+            hasSavedLayout: hasSaved,
+            onSave: { [weak self] in self?.onSaveWorkspaceLayout?(workspaceId) },
+            onReset: { [weak self] in self?.onResetWorkspaceLayout?(workspaceId) })
+    }
+
+    /// Build the layout context menu: "Save Layout" (always enabled) and "Reset to Saved
+    /// Layout" (enabled only when a snapshot exists). `autoenablesItems = false` so the
+    /// explicit `isEnabled` sticks (AppKit would otherwise validate against target/action).
+    static func makeLayoutMenu(hasSavedLayout: Bool,
+                               onSave: @escaping () -> Void,
+                               onReset: @escaping () -> Void) -> NSMenu {
+        let menu = NSMenu()
+        menu.autoenablesItems = false
+        menu.addItem(ClosureMenuItem(title: "Save Layout", handler: onSave))
+        let reset = ClosureMenuItem(title: "Reset to Saved Layout", handler: onReset)
+        reset.isEnabled = hasSavedLayout
+        menu.addItem(reset)
+        return menu
     }
 
     private func toggleDropdown() {
@@ -804,6 +855,25 @@ final class ClosureButton: NSButton {
             ring.stroke()
         }
     }
+}
+
+/// A closure-driven `NSMenuItem` (AppKit menu items are otherwise target/action only).
+final class ClosureMenuItem: NSMenuItem {
+    private let handler: () -> Void
+
+    init(title: String, handler: @escaping () -> Void) {
+        self.handler = handler
+        super.init(title: title, action: #selector(fire), keyEquivalent: "")
+        target = self
+    }
+
+    @available(*, unavailable)
+    required init(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    @objc private func fire() { handler() }
+
+    /// Invoke the item's action programmatically (unit tests have no mouse).
+    func performAction() { handler() }
 }
 
 /// A hover-highlighting clickable row used in the dropdown.

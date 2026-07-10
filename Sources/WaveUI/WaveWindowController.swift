@@ -141,6 +141,8 @@ public final class WaveWindowController: NSWindowController, AppCoordinatorDeleg
         tabBar.onSetWorkspaceIcon = { [weak self] id, icon in self?.coordinator.setWorkspaceIcon(id: id, icon: icon) }
         tabBar.onSaveWorkspace = { [weak self] id in self?.coordinator.saveWorkspace(id) }
         tabBar.onDeleteWorkspace = { [weak self] id in self?.coordinator.deleteWorkspace(id) }
+        tabBar.onSaveWorkspaceLayout = { [weak self] id in self?.coordinator.saveWorkspaceLayout(id) }
+        tabBar.onResetWorkspaceLayout = { [weak self] id in self?.coordinator.restoreWorkspaceLayout(id) }
         tabBar.onMoveTab = { [weak self] tabId, wsId in
             self?.coordinator.moveTabToWorkspace(tabId: tabId, workspaceId: wsId)
         }
@@ -313,6 +315,41 @@ public final class WaveWindowController: NSWindowController, AppCoordinatorDeleg
         (window as? WaveWindow)?.onKeyEquivalent = { [weak self] event in
             self?.handleGlobalKey(event) ?? false
         }
+        (window as? WaveWindow)?.onPreemptKeyEquivalent = { [weak self] event in
+            self?.handlePreemptKey(event) ?? false
+        }
+    }
+
+    /// Shortcuts that must run BEFORE the responder chain (the window's preempt
+    /// hook), because a focused WKWebView claims every ⌘ key equivalent (it forwards
+    /// them to the page and returns true), so nothing ⌘-based would ever reach
+    /// `handleGlobalKey` from a web pane:
+    ///   * ⌘⌥ Arrow pane navigation — preempted for EVERY pane (terminals never
+    ///     consume ⌘⌥-arrows, so this shadows nothing).
+    ///   * The app-global bindings — preempted only while web PAGE content holds
+    ///     focus, mirroring Electron (globals intercept before the page). Keys the
+    ///     globals decline (⌘C/V/A/F…) still reach the page, and ⌘←/→ are excluded
+    ///     so they keep their browser meaning (history back/forward) instead of tab
+    ///     switching; ⌘[/⌘] stay tab switching, matching every non-web pane.
+    private func handlePreemptKey(_ event: NSEvent) -> Bool {
+        let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        let scalar = event.charactersIgnoringModifiers?.unicodeScalars.first?.value
+        if let dir = Self.paneNavDirection(flags: flags, scalar: scalar) {
+            activeLayoutView?.navigatePane(dir)
+            return true
+        }
+        if activeLayoutView?.firstResponderIsWebPageContent == true, !Self.isWebHistoryKey(scalar: scalar) {
+            return handleGlobalKey(event)
+        }
+        return false
+    }
+
+    /// Whether a ⌘ key event must stay with focused web page content instead of
+    /// being preempted for the app-global bindings: ⌘←/→ are browser history
+    /// back/forward there, so tab switching yields to them (only) in that state.
+    static func isWebHistoryKey(scalar: UInt32?) -> Bool {
+        guard let scalar else { return false }
+        return Int(scalar) == NSLeftArrowFunctionKey || Int(scalar) == NSRightArrowFunctionKey
     }
 
     /// Match Electron's app-global bindings (`keymodel.ts` `registerGlobalKeys`).
@@ -321,15 +358,8 @@ public final class WaveWindowController: NSWindowController, AppCoordinatorDeleg
     private func handleGlobalKey(_ event: NSEvent) -> Bool {
         let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
 
-        // ⌘⌥ Arrow: iTerm2-style directional pane focus. Handled before the Cmd-only guard
-        // below (which rejects Option). The terminal declines these, so they reach here;
-        // plain ⌘ Arrow (no Option) still falls through to tab switching further down.
-        if let dir = Self.paneNavDirection(
-            flags: flags, scalar: event.charactersIgnoringModifiers?.unicodeScalars.first?.value
-        ) {
-            activeLayoutView?.navigatePane(dir)
-            return true
-        }
+        // ⌘⌥ Arrow pane navigation lives in `handlePreemptKey` (the window's preempt
+        // hook); plain ⌘ Arrow (no Option) still falls through to tab switching below.
 
         guard flags.contains(.command), !flags.contains(.control), !flags.contains(.option) else { return false }
         let shift = flags.contains(.shift)

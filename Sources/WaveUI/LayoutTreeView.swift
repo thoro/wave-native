@@ -709,6 +709,13 @@ final class LayoutTreeView: NSView {
         }
         addSubview(view)
         blockViews[leaf.blockId] = view
+        // Content mounts SYNCHRONOUSLY inside the view's init when the block object
+        // is already in the store cache (applyLayoutState pre-loads it), which fires
+        // onContentMounted before the closure above exists. Replay it, or a pending
+        // focus-follows-split id never clears — and then EVERY later layout publish
+        // (focusActiveBlock's pending branch) steals keyboard focus back to this
+        // pane, fighting any pane the user clicks afterwards.
+        if view.hasMountedContent { view.onContentMounted?() }
         return view
     }
 
@@ -875,6 +882,39 @@ final class LayoutTreeView: NSView {
         return super.hitTest(point)
     }
 
+    /// Pane focus follows keyboard focus. Some focus routes never pass through this
+    /// view's own click paths: a WKWebView claims the firstResponder itself on a click
+    /// into page content, and a header's URL field hands focus to the window's field
+    /// editor. Observing the window's firstResponder catches every route with one
+    /// mechanism. The handler only RECORDS focus (green border + persisted
+    /// focusednodeid) — it must never move the responder itself, which would re-fire
+    /// the observation (loop) or steal keyboard focus from a header text field — and
+    /// it defers a runloop hop so layout is never mutated mid-responder-transition.
+    private var responderObservation: NSKeyValueObservation?
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        responderObservation = nil
+        guard let window else { return }
+        responderObservation = window.observe(\.firstResponder) { [weak self] _, _ in
+            DispatchQueue.main.async { self?.syncFocusToResponder() }
+        }
+    }
+
+    private func syncFocusToResponder() {
+        guard !isHidden, let responder = window?.firstResponder as? NSView else { return }
+        guard let entry = blockViews.first(where: { responder.isDescendant(of: $0.value) }) else { return }
+        let blockId = entry.key
+        dndLog("layoutview syncFocus responder=\(type(of: responder)) block=\(blockId.suffix(4)) focusedNode=\(focusedNodeId?.suffix(4) ?? "nil")")
+        if frames.first(where: { $0.nodeId == focusedNodeId })?.blockId == blockId { return }
+        navGoalX = nil
+        navGoalY = nil
+        applyFocusBorder(toBlockId: blockId)
+        if let nodeId = frames.first(where: { $0.blockId == blockId })?.nodeId {
+            onLayoutAction?(.focusNode(nodeId: nodeId))
+        }
+    }
+
     /// Move the window firstResponder to the focused leaf's content (focus-follows
     /// -tab). On a tab switch the controller only flips `isHidden`, so the content
     /// view's `viewDidMoveToWindow` never re-fires; this re-establishes focus.
@@ -890,6 +930,7 @@ final class LayoutTreeView: NSView {
         // re-assert the focus border out of turn.
         if let pending = pendingFocusBlockId {
             if let view = blockViews[pending] {
+                dndLog("layoutview focusActiveBlock pending=\(pending.suffix(4))")
                 view.focusContent()
                 return
             }
@@ -897,7 +938,18 @@ final class LayoutTreeView: NSView {
         }
         let leaf = frames.first(where: { $0.nodeId == focusedNodeId }) ?? frames.first
         guard let leaf else { return }
+        dndLog("layoutview focusActiveBlock leaf=\(leaf.blockId.suffix(4)) focusedNode=\(focusedNodeId?.suffix(4) ?? "nil")")
         blockViews[leaf.blockId]?.focusContent()
+    }
+
+    /// Whether the window's firstResponder sits inside a web pane's PAGE content
+    /// (the WKWebView subtree). Keys sent down the responder chain would then be
+    /// claimed by the web view, so the controller must run app-global ⌘ bindings
+    /// from the window's preempt hook instead of the normal after-chain hook.
+    var firstResponderIsWebPageContent: Bool {
+        guard !isHidden, let responder = window?.firstResponder as? NSView else { return false }
+        guard let frame = blockViews.values.first(where: { responder.isDescendant(of: $0) }) else { return false }
+        return frame.ownsWebPageResponder(responder)
     }
 
     /// Reload the focused block's content (Cmd-R). Resolves the focused pane — the
@@ -933,9 +985,20 @@ final class LayoutTreeView: NSView {
         navGoalX = nil
         navGoalY = nil
         pendingFocusBlockId = blockId
-        guard blockViews[blockId]?.window != nil else { return }
-        blockViews[blockId]?.focusContent()
+        guard let view = blockViews[blockId], view.window != nil else { return }
+        // Border/state first, keyboard second: the responder change from
+        // focusContent() re-enters syncFocusToResponder, which then no-ops because
+        // this pane is already recorded as focused.
         applyFocusBorder(toBlockId: blockId)
+        view.focusContent()
+        // A pending id is ONLY for content that hasn't mounted yet (focus-follows-
+        // split). Leaving it set for a mounted pane makes it a sticky focus theft:
+        // every later layout publish runs focusActiveBlock, whose pending branch
+        // would re-assert THIS pane over wherever the user has since clicked
+        // (observed as web panes never regaining focus — the .focusNode dispatch a
+        // web click triggers published a layout update that immediately snapped
+        // focus back to the previously clicked terminal).
+        if view.hasMountedContent { pendingFocusBlockId = nil }
         // Persist the click-driven focus into the layout model. The green border lives
         // only in this view's local `focusedNodeId`; window-level Cmd-W / split / magnify
         // read `model.focusedNodeId` (AppCoordinator.currentFocusedBlockId), so without

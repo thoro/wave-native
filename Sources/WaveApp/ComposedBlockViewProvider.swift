@@ -92,9 +92,9 @@ final class ComposedBlockViewProvider: BlockViewProvider {
             view.searchTemplate = Self.webSearchTemplate(from: latestSettings)
             webViews.add(view)
             wireWebNav(view: view, bridge: env.webNav)
-            // Clicking / focusing the web content focuses this pane (green border).
-            let webBlockId = env.blockRef.oid
-            view.onFocusRequest = { env.onRequestFocus?(webBlockId) }
+            // Clicking / focusing the web content focuses this pane (green border):
+            // handled centrally by LayoutTreeView's firstResponder observation, so no
+            // per-view focus wiring is needed here.
             return view
         case TerminalBlockConst.viewType:
             return makeTerminalView(env: env)

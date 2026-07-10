@@ -62,6 +62,9 @@ final class TabBarView: NSView {
     var onSetWorkspaceIcon: ((String, String) -> Void)?
     var onSaveWorkspace: ((String) -> Void)?
     var onDeleteWorkspace: ((String) -> Void)?
+    /// Switcher row right-click "Save Layout" / "Reset to Saved Layout". Carries the workspaceId.
+    var onSaveWorkspaceLayout: ((String) -> Void)?
+    var onResetWorkspaceLayout: ((String) -> Void)?
     /// Raised from a tab's "Move to Workspace" submenu, and from a cross-workspace
     /// drag-drop. Carries (tabId, destWorkspaceId).
     var onMoveTab: ((String, String) -> Void)?
@@ -170,6 +173,8 @@ final class TabBarView: NSView {
         workspaceSwitcher.onSetWorkspaceIcon = { [weak self] id, icon in self?.onSetWorkspaceIcon?(id, icon) }
         workspaceSwitcher.onSaveWorkspace = { [weak self] id in self?.onSaveWorkspace?(id) }
         workspaceSwitcher.onDeleteWorkspace = { [weak self] id in self?.onDeleteWorkspace?(id) }
+        workspaceSwitcher.onSaveWorkspaceLayout = { [weak self] id in self?.onSaveWorkspaceLayout?(id) }
+        workspaceSwitcher.onResetWorkspaceLayout = { [weak self] id in self?.onResetWorkspaceLayout?(id) }
         addSubview(workspaceSwitcher)
 
         tabsContainer.translatesAutoresizingMaskIntoConstraints = false
