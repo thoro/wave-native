@@ -90,7 +90,27 @@ final class TerminalFindBarView: NSView, NSTextFieldDelegate {
 
     var query: String { field.stringValue }
 
+    private var lastCount: (current: Int, total: Int, truncated: Bool) = (0, 0, false)
+    private var busy = false
+
     func setCount(current: Int, total: Int, truncated: Bool) {
+        lastCount = (current, total, truncated)
+        renderCount()
+    }
+
+    /// A match jump is in flight (history chunk fetch + parse can take
+    /// seconds); the count area shows an ellipsis until it lands.
+    func setBusy(_ value: Bool) {
+        busy = value
+        renderCount()
+    }
+
+    private func renderCount() {
+        if busy {
+            countLabel.stringValue = "…"
+            return
+        }
+        let (current, total, truncated) = lastCount
         if total == 0 {
             countLabel.stringValue = field.stringValue.isEmpty ? "" : "No results"
         } else {

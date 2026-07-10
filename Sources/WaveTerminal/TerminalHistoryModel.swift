@@ -546,36 +546,64 @@ public final class TerminalHistoryModel {
         return total + Int((lineInChunk * wrapFactor).rounded())
     }
 
+    /// How far (visual rows, each direction) locateMatch content-verifies
+    /// around the estimated row. The scratch-VT's logical lines drift from the
+    /// backend's raw-\n numbering (readline hard-wraps a long prompt line
+    /// without emitting \n, so the VT counts more lines than the file has
+    /// newlines), and the drift accumulates over a session.
+    public static let matchWindowRows = 120
+
     /// Locate a search match precisely: ensure the containing chunk is parsed,
-    /// then find the visual row of the match line whose text contains `query`
-    /// (the line may wrap across several rows). Returns the global history row
-    /// and the matched column range, or nil when the match is past the
-    /// coverage end (i.e. in the live sink) or the chunk cannot load.
+    /// then content-verify outward from the estimated row (the backend's line
+    /// number is only near the match -- see `matchWindowRows`). Returns the
+    /// global history row and the matched column range, or nil when the match
+    /// is past the coverage end (i.e. in the live sink) or the chunk cannot
+    /// load.
     public func locateMatch(line: Int64, query: String) async -> (row: Int, cols: Range<Int>)? {
         guard line >= 0, line < historyEndLine else { return nil }
         let chunkIdx = Int(line / Self.linesPerChunk)
         guard await ensureChunk(chunkIdx), let chunk = chunks[chunkIdx] else { return nil }
         let lineInChunk = Int(line - chunk.startLine)
         guard lineInChunk >= 0, lineInChunk < chunk.lineStartRows.count else { return nil }
-        let firstRow = chunk.lineStartRows[lineInChunk]
-        let endRow = lineInChunk + 1 < chunk.lineStartRows.count
-            ? chunk.lineStartRows[lineInChunk + 1]
-            : chunk.rows.count
-        let needle = query.lowercased()
+        let estRow = chunk.lineStartRows[lineInChunk]
+        var rowLimit = chunk.rows.count
+        if let cut = seamCut, cut.chunkIndex == chunkIdx {
+            rowLimit = Swift.min(rowLimit, cut.rowInChunk)
+        }
         var globalBase = 0
         for i in 0..<chunkIdx {
             globalBase += rowCount(ofChunk: i)
         }
-        for rowIdx in firstRow..<endRow {
-            let row = chunk.rows[rowIdx]
-            if let r = row.plain.lowercased().range(of: needle) {
+        if let hit = Self.findQuery(query, in: chunk.rows, nearRow: estRow, window: Self.matchWindowRows, rowLimit: rowLimit) {
+            return (globalBase + hit.row, hit.cols)
+        }
+        guard estRow < rowLimit else { return nil }
+        return (globalBase + estRow, 0..<Swift.max(1, chunk.rows[estRow].cells.count))
+    }
+
+    /// Case-insensitive search for `query` in `rows`, checking the estimated
+    /// row first and stepping outward one row at a time so the occurrence
+    /// nearest the estimate wins (periodic content would otherwise snap to the
+    /// window edge). Rows at/past `rowLimit` are never inspected (they render
+    /// through the sink, not history).
+    nonisolated static func findQuery(
+        _ query: String, in rows: [TermHistoryRow], nearRow estRow: Int, window: Int, rowLimit: Int
+    ) -> (row: Int, cols: Range<Int>)? {
+        guard !query.isEmpty else { return nil }
+        let needle = query.lowercased()
+        let limit = Swift.min(rowLimit, rows.count)
+        guard limit > 0 else { return nil }
+        for delta in 0...Swift.max(0, window) {
+            for rowIdx in delta == 0 ? [estRow] : [estRow + delta, estRow - delta] {
+                guard rowIdx >= 0, rowIdx < limit else { continue }
+                let row = rows[rowIdx]
+                guard let r = row.plain.lowercased().range(of: needle) else { continue }
                 let lower = row.plain.distance(from: row.plain.startIndex, to: r.lowerBound)
                 let upper = row.plain.distance(from: row.plain.startIndex, to: r.upperBound)
-                let colRange = Self.columnRange(offsets: row.offsets, plain: row.plain, lower: lower, upper: upper)
-                return (globalBase + rowIdx, colRange)
+                return (rowIdx, Self.columnRange(offsets: row.offsets, plain: row.plain, lower: lower, upper: upper))
             }
         }
-        return (globalBase + firstRow, 0..<Swift.max(1, chunk.rows[firstRow].cells.count))
+        return nil
     }
 
     /// Map a character range in `plain` to a column range via the per-column

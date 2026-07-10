@@ -204,6 +204,9 @@ public final class GhosttyTerminalView: NSView {
 
     private var findBar: TerminalFindBarView?
     private var findDebounce: Task<Void, Never>?
+    /// The in-flight match jump; superseded (cancelled) by every new jump so
+    /// rapid next/next/next cannot land out of order after slow chunk loads.
+    private var jumpTask: Task<Void, Never>?
     private var searchMatches: [TermSearchMatch] = []
     private var searchIndex = 0
     private var searchTruncated = false
@@ -1157,6 +1160,7 @@ public final class GhosttyTerminalView: NSView {
 
     func hideFindBar() {
         findDebounce?.cancel()
+        jumpTask?.cancel()
         findBar?.removeFromSuperview()
         findBar = nil
         searchMatches = []
@@ -1206,9 +1210,14 @@ public final class GhosttyTerminalView: NSView {
     /// Jump to a search match: history matches page in their chunk and center
     /// with a highlight wash; sink matches scroll the live viewport by line
     /// fraction, then content-verify against the visible rows and select the
-    /// hit natively.
+    /// hit natively. History jumps can take seconds (10k-line chunk fetch +
+    /// scratch-VT parse), so the find bar shows a busy state until the jump
+    /// lands and a newer jump supersedes this one.
     private func jumpToMatch(_ match: TermSearchMatch, query: String) {
-        Task { @MainActor [weak self] in
+        jumpTask?.cancel()
+        findBar?.setBusy(true)
+        jumpTask = Task { @MainActor [weak self] in
+            defer { self?.findBar?.setBusy(false) }
             guard let self else { return }
             // Anchor the seam first: coverage must include every line the sink
             // no longer retains (pruned or reset-wiped) before deciding whether
@@ -1218,7 +1227,9 @@ public final class GhosttyTerminalView: NSView {
             if !self.history.seamFresh(currentOffset: offset, pruned: snapshot.pruned) {
                 _ = await self.history.reanchorSeam(sinkTop: snapshot, currentOffset: offset)
             }
+            if Task.isCancelled { return }
             if let hit = await self.history.locateMatch(line: match.line, query: query) {
+                if Task.isCancelled { return }
                 self.pinSinkToTop()
                 let total = self.history.totalRows()
                 self.historyScrollRows = Swift.max(1, Swift.min(total, total - hit.row + self.lastRows / 2))
@@ -1227,10 +1238,13 @@ public final class GhosttyTerminalView: NSView {
                 self.needsDisplay = true
                 return
             }
+            if Task.isCancelled { return }
             // In the sink layer: scroll to the match line's fraction and verify.
             self.exitHistory()
             self.scrollSinkToLine(match.line)
-            self.highlightInVisibleSinkRows(query: query)
+            if !self.highlightInVisibleSinkRows(query: query) {
+                self.pageWalkSinkToQuery(query)
+            }
             self.needsDisplay = true
         }
     }
@@ -1257,10 +1271,13 @@ public final class GhosttyTerminalView: NSView {
     }
 
     /// Find the query in the currently visible sink rows and select it natively
-    /// (the existing selection wash becomes the match highlight).
-    private func highlightInVisibleSinkRows(query: String) {
-        guard !query.isEmpty else { return }
+    /// (the existing selection wash becomes the match highlight). Returns
+    /// whether the query was found on screen.
+    @discardableResult
+    private func highlightInVisibleSinkRows(query: String) -> Bool {
+        guard !query.isEmpty else { return false }
         let needle = query.lowercased()
+        var found = false
         sink.withTerminal { [weak self] terminal in
             guard let self, let state = self.renderState,
                   ghostty_render_state_update(state, terminal) == GHOSTTY_SUCCESS,
@@ -1282,8 +1299,51 @@ public final class GhosttyTerminalView: NSView {
                 sel.start = s
                 sel.end = e
                 withUnsafePointer(to: &sel) { _ = ghostty_terminal_set(terminal, GHOSTTY_TERMINAL_OPT_SELECTION, $0) }
+                found = true
                 return
             }
+        }
+        return found
+    }
+
+    /// Pages the fraction-scroll may be off by before a sink match is declared
+    /// missing (wrapped rows skew the line->row mapping locally).
+    private static let sinkVerifyPages = 6
+
+    /// The line-fraction landing missed the match: probe outward page by page
+    /// (nearest first) and settle on the first viewport that contains the
+    /// query. Restores the landing position when nothing is found in range.
+    private func pageWalkSinkToQuery(_ query: String) {
+        guard let start = sinkScrollbarState(), start.total > start.len else { return }
+        for delta in 1...Self.sinkVerifyPages {
+            for dir in [delta, -delta] {
+                let target = Swift.max(0, Swift.min(start.total - start.len, start.offset + dir * start.len))
+                guard target != start.offset else { continue }
+                scrollSink(toOffset: target)
+                if highlightInVisibleSinkRows(query: query) { return }
+            }
+        }
+        scrollSink(toOffset: start.offset)
+    }
+
+    private func sinkScrollbarState() -> (offset: Int, len: Int, total: Int)? {
+        var result: (Int, Int, Int)?
+        sink.withTerminal { terminal in
+            var sb = GhosttyTerminalScrollbar()
+            guard ghostty_terminal_get(terminal, GHOSTTY_TERMINAL_DATA_SCROLLBAR, &sb) == GHOSTTY_SUCCESS else { return }
+            result = (Int(sb.offset), Int(sb.len), Int(sb.total))
+        }
+        return result
+    }
+
+    private func scrollSink(toOffset target: Int) {
+        sink.withTerminal { terminal in
+            var sb = GhosttyTerminalScrollbar()
+            guard ghostty_terminal_get(terminal, GHOSTTY_TERMINAL_DATA_SCROLLBAR, &sb) == GHOSTTY_SUCCESS else { return }
+            var behavior = GhosttyTerminalScrollViewport()
+            behavior.tag = GHOSTTY_SCROLL_VIEWPORT_DELTA
+            behavior.value.delta = target - Int(sb.offset)
+            ghostty_terminal_scroll_viewport(terminal, behavior)
         }
     }
 

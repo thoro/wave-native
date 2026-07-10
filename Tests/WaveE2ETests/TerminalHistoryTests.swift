@@ -154,6 +154,77 @@ final class SeamMatchTests: XCTestCase {
     }
 }
 
+final class FindQueryWindowTests: XCTestCase {
+
+    // The backend's raw-\n line numbers drift from the scratch-VT's logical
+    // lines (readline hard-wraps without emitting \n), so the estimated row is
+    // near -- not at -- the match. findQuery must recover the real row.
+
+    func testExactEstimate() {
+        let rows = ["line 40", "line 41", "line 42 UNIQMARK", "line 43"].map { histRow($0) }
+        let hit = TerminalHistoryModel.findQuery("UNIQMARK", in: rows, nearRow: 2, window: 120, rowLimit: rows.count)
+        XCTAssertEqual(hit?.row, 2)
+        XCTAssertEqual(hit?.cols, 8..<16)
+    }
+
+    func testOffByOneDriftRecovers() {
+        // estimate points at "line 41" (the reproduced bug); the match is one
+        // row further down and must win over the full-row fallback
+        let rows = ["line 40", "line 41", "line 42 UNIQMARK", "line 43"].map { histRow($0) }
+        let hit = TerminalHistoryModel.findQuery("UNIQMARK", in: rows, nearRow: 1, window: 120, rowLimit: rows.count)
+        XCTAssertEqual(hit?.row, 2)
+        XCTAssertEqual(hit?.cols, 8..<16)
+    }
+
+    func testNearestOccurrenceWinsOverWindowEdge() {
+        // periodic content: every row matches; the row nearest the estimate
+        // must win, not the window's lowest row
+        let rows = (0..<50).map { histRow("line \($0)") }
+        let hit = TerminalHistoryModel.findQuery("line", in: rows, nearRow: 25, window: 120, rowLimit: rows.count)
+        XCTAssertEqual(hit?.row, 25)
+    }
+
+    func testEquidistantPrefersLaterRow() {
+        let rows = ["hit", "x", "hit"].map { histRow($0) }
+        let hit = TerminalHistoryModel.findQuery("hit", in: rows, nearRow: 1, window: 120, rowLimit: rows.count)
+        XCTAssertEqual(hit?.row, 2)
+    }
+
+    func testCaseInsensitive() {
+        let rows = [histRow("some ErrOr here")]
+        let hit = TerminalHistoryModel.findQuery("error", in: rows, nearRow: 0, window: 0, rowLimit: rows.count)
+        XCTAssertEqual(hit?.row, 0)
+        XCTAssertEqual(hit?.cols, 5..<10)
+    }
+
+    func testRowLimitExcludesSinkRenderedRows() {
+        // rows at/past the seam cut belong to the sink layer; a match there
+        // must not be claimed by the history highlight
+        let rows = ["a", "b", "needle"].map { histRow($0) }
+        XCTAssertNil(TerminalHistoryModel.findQuery("needle", in: rows, nearRow: 1, window: 120, rowLimit: 2))
+    }
+
+    func testBeyondWindowNotFound() {
+        var rows = (0..<300).map { histRow("filler \($0)") }
+        rows[299] = histRow("needle")
+        XCTAssertNil(TerminalHistoryModel.findQuery("needle", in: rows, nearRow: 0, window: 120, rowLimit: rows.count))
+        XCTAssertEqual(TerminalHistoryModel.findQuery("needle", in: rows, nearRow: 250, window: 120, rowLimit: rows.count)?.row, 299)
+    }
+
+    func testEmptyQueryAndEmptyRows() {
+        let rows = [histRow("x")]
+        XCTAssertNil(TerminalHistoryModel.findQuery("", in: rows, nearRow: 0, window: 10, rowLimit: rows.count))
+        XCTAssertNil(TerminalHistoryModel.findQuery("x", in: [], nearRow: 0, window: 10, rowLimit: 0))
+    }
+
+    func testEstimateOutOfBoundsStillSearchesWindow() {
+        // a drifted estimate can point past the parsed rows; nearby in-bounds
+        // rows are still checked
+        let rows = ["a", "b", "needle"].map { histRow($0) }
+        XCTAssertEqual(TerminalHistoryModel.findQuery("needle", in: rows, nearRow: 5, window: 120, rowLimit: rows.count)?.row, 2)
+    }
+}
+
 final class TermScrollbarMathTests: XCTestCase {
 
     func testNoBarWhenContentFits() {
