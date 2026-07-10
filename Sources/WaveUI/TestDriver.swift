@@ -239,6 +239,10 @@ public final class TestDriver {
             return
         }
         switch name {
+        // Real hardware Shift+Tab delivers NSBackTabCharacter (0x19), not "\t";
+        // mirror that so driver runs exercise the same encoder path.
+        case "tab" where flags.contains(.shift):
+            sendKey("\u{19}", window: window, flags: flags, keyCode: 48)
         case "tab": sendKey("\t", window: window, flags: flags, keyCode: 48)
         case "esc": sendKey("\u{1b}", window: window, flags: flags, keyCode: 53)
         case "backspace": sendKey("\u{7f}", window: window, flags: flags, keyCode: 51)

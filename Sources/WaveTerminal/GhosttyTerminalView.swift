@@ -3110,6 +3110,10 @@ public final class GhosttyTerminalView: NSView {
         // `ESC[<n>;<mod>~` for Page/Delete) so Shift+arrow and Ctrl+arrow work
         // instead of sending a bare arrow.
         if let ignoring = event.charactersIgnoringModifiers, let scalar = ignoring.unicodeScalars.first {
+            // Shift+Tab arrives as NSBackTabCharacter (0x19). Passing it raw would
+            // send Ctrl-Y — readline's yank, i.e. it "pastes" the kill ring — so
+            // encode the xterm backtab CSI Z (what Claude Code etc. expect).
+            if scalar.value == 0x19 { return esc("[Z") }
             // Option-only nav chords use the emacs Meta forms, NOT xterm CSI:
             // readline binds both, but libedit (psql on macOS) only understands
             // these — CSI `ESC[1;3D` renders as `;3D` garbage there. Matches

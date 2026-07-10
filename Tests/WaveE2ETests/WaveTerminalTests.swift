@@ -531,6 +531,22 @@ final class TerminalKeyEncodingTests: XCTestCase {
         XCTAssertEqual(GhosttyTerminalView.bytes(for: keyEvent(0x0d, flags: [])), Data([0x0d]))
         XCTAssertEqual(GhosttyTerminalView.bytes(for: keyEvent(0x0d, flags: [.shift])), Data([0x0a]))
     }
+
+    /// Shift+Tab arrives as NSBackTabCharacter (0x19 = Ctrl-Y!). It must encode as the
+    /// xterm backtab CSI Z, not pass through raw — 0x19 is readline's yank, so it would
+    /// paste the kill ring instead of cycling modes in TUIs like Claude Code.
+    func testShiftTabEncodesBacktabNotCtrlY() {
+        let esc = Data([0x1b])
+        XCTAssertEqual(GhosttyTerminalView.bytes(for: keyEvent(0x19, flags: [.shift])),
+                       esc + Data("[Z".utf8))
+        // Backtab wins even with extra modifiers held.
+        XCTAssertEqual(GhosttyTerminalView.bytes(for: keyEvent(0x19, flags: [.shift, .option])),
+                       esc + Data("[Z".utf8))
+        // Plain Tab and a real Ctrl-Y are unaffected.
+        XCTAssertEqual(GhosttyTerminalView.bytes(for: keyEvent(0x09, flags: [])), Data([0x09]))
+        XCTAssertEqual(GhosttyTerminalView.bytes(for: keyEvent(Int(UnicodeScalar("y").value), flags: [.control])),
+                       Data([0x19]))
+    }
 }
 
 /// `isDirectlyEncodedKey` is the gate that keeps control/navigation keys on the direct
