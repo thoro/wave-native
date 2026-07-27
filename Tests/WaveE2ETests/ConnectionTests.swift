@@ -228,6 +228,30 @@ final class ConnectionTests: XCTestCase {
                        "split must persist the source pane's cwd as cmd:cwd")
     }
 
+    /// An update replaces the native UI process, clearing the provider's in-memory OSC 7
+    /// cache while the source block and its persisted metadata survive. Splitting during
+    /// that restore window must use the persisted cwd instead of opening at `/`.
+    func testSplitAfterRestartFallsBackToPersistedCwd() async throws {
+        let (t, s) = makeConnWorld()
+        s.preload(.block(Block(
+            oid: "blk-1", version: 2,
+            meta: ["view": .string("term"), "cmd:cwd": .string("/Users/me/restored-project")]
+        )))
+        let coordinator = AppCoordinator(transport: t, store: s)
+        let delegate = CwdStubDelegate(cwd: nil)
+        coordinator.delegate = delegate
+        coordinator.start()
+        await fulfillment(of: [delegate.ready], timeout: 2)
+
+        coordinator.splitFocusedBlock(blockId: "blk-1", direction: "horizontal")
+        try await Task.sleep(nanoseconds: 250_000_000)
+
+        let create = try XCTUnwrap(t.recordedGeneric().first { $0.command == "createblock" })
+        let payload = try XCTUnwrap(create.data).decodeAsCreateBlock()
+        XCTAssertEqual(payload["cmd:cwd"], "/Users/me/restored-project",
+                       "restored split must inherit the persisted source cwd")
+    }
+
     /// With no known cwd (the pane never reported OSC 7), the split's CreateBlock payload
     /// must NOT carry `cmd:cwd` — the new shell opens at the backend default directory.
     func testSplitWithoutKnownCwdOmitsCmdCwdMeta() async throws {

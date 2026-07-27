@@ -549,6 +549,369 @@ final class TerminalKeyEncodingTests: XCTestCase {
     }
 }
 
+/// Per-frame find-highlight scanning: every visible occurrence of the query maps
+/// to cell columns, so washes recompute from CONTENT each draw and follow their
+/// text when a streaming TUI scrolls the screen.
+final class FindOccurrenceColsTests: XCTestCase {
+    private func asciiOffsets(_ line: String) -> [Int] {
+        Array(0..<line.utf16.count)
+    }
+
+    func testMultipleOccurrencesOnOneRow() {
+        let line = "err then err again err"
+        let cols = GhosttyTerminalView.findOccurrenceCols(line: line, offsets: asciiOffsets(line), needle: "err")
+        XCTAssertEqual(cols, [0...2, 9...11, 19...21])
+    }
+
+    func testCaseInsensitive() {
+        let line = "Error ERROR error"
+        let cols = GhosttyTerminalView.findOccurrenceCols(line: line, offsets: asciiOffsets(line), needle: "eRrOr")
+        XCTAssertEqual(cols, [0...4, 6...10, 12...16])
+    }
+
+    func testNoMatchAndEmptyInputs() {
+        XCTAssertEqual(GhosttyTerminalView.findOccurrenceCols(line: "abc", offsets: [0, 1, 2], needle: "xyz"), [])
+        XCTAssertEqual(GhosttyTerminalView.findOccurrenceCols(line: "", offsets: [], needle: "x"), [])
+        XCTAssertEqual(GhosttyTerminalView.findOccurrenceCols(line: "abc", offsets: [0, 1, 2], needle: ""), [])
+    }
+
+    func testOverlappingCandidatesScanForward() {
+        // "aaaa" with needle "aa" -> non-overlapping forward matches.
+        let line = "aaaa"
+        let cols = GhosttyTerminalView.findOccurrenceCols(line: line, offsets: asciiOffsets(line), needle: "aa")
+        XCTAssertEqual(cols, [0...1, 2...3])
+    }
+
+    func testColumnsSharingAnOffsetAreAllCovered() {
+        // A wide glyph's lead + spacer cells share one text offset; the wash
+        // must cover BOTH columns, and neighbors stay untouched.
+        let line = "本ok"
+        let offsets = [0, 0, 1, 2]
+        XCTAssertEqual(GhosttyTerminalView.findOccurrenceCols(line: line, offsets: offsets, needle: "本"),
+                       [0...1])
+        XCTAssertEqual(GhosttyTerminalView.findOccurrenceCols(line: line, offsets: offsets, needle: "ok"),
+                       [2...3])
+    }
+
+    func testUserSelectionPaintsAboveSupplementalFindHighlight() {
+        XCTAssertEqual(
+            GhosttyTerminalView.cellOverlayOrder(
+                hasFind: true, hasCursor: true, selected: true),
+            [.find, .cursor, .selection])
+        XCTAssertEqual(
+            GhosttyTerminalView.cellOverlayOrder(
+                hasFind: true, hasCursor: false, selected: true),
+            [.find, .selection])
+    }
+}
+
+/// Find navigation must not borrow Ghostty's active selection. That selection is
+/// the source of truth for Cmd-C, whether it came from a drag or a word gesture.
+final class TerminalFindSelectionTests: XCTestCase {
+    func testCurrentMarkerAndClosingFindPreserveCopySelection() {
+        let sink = GhosttySink(cols: 40, rows: 5)
+        let controller = TerminalController(
+            blockId: "11111111-1111-1111-1111-111111111111",
+            tabId: "22222222-2222-2222-2222-222222222222",
+            transport: MockTransport(),
+            sink: sink)
+        let view = GhosttyTerminalView(
+            controller: controller, sink: sink,
+            font: .monospacedSystemFont(ofSize: 12, weight: .regular))
+        sink.feed(Data("find copyword".utf8))
+
+        installSelection(5...12, in: sink)
+        XCTAssertEqual(selectionText(in: sink), "copyword")
+
+        XCTAssertTrue(view.markCurrentMatchInVisibleSinkRows(query: "find"))
+        XCTAssertEqual(
+            selectionText(in: sink), "copyword",
+            "moving the current search result must not replace the user's Copy selection")
+
+        view.showFindBar()
+        view.hideFindBar()
+        XCTAssertEqual(
+            selectionText(in: sink), "copyword",
+            "closing Find must remove only find UI, not the user's selection")
+    }
+
+    func testDoubleClickWordSelectionStillCopiesWhileFindIsOpen() throws {
+        let sink = GhosttySink(cols: 40, rows: 5)
+        let controller = TerminalController(
+            blockId: "11111111-1111-1111-1111-111111111111",
+            tabId: "22222222-2222-2222-2222-222222222222",
+            transport: MockTransport(),
+            sink: sink)
+        let font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
+        let view = GhosttyTerminalView(controller: controller, sink: sink, font: font)
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 480, height: 160),
+            styleMask: .borderless, backing: .buffered, defer: false)
+        window.contentView = view
+        view.setFrameSize(NSSize(width: 480, height: 160))
+        sink.feed(Data("find copyword".utf8))
+
+        view.showFindBar()
+        XCTAssertTrue(view.markCurrentMatchInVisibleSinkRows(query: "find"))
+
+        let cell = GhosttyTerminalView.measureCell(font: font)
+        let localPoint = NSPoint(
+            x: 10 + CGFloat(7) * cell.width + cell.width / 2,
+            y: 4 + cell.height / 2)
+        let event = try XCTUnwrap(NSEvent.mouseEvent(
+            with: .leftMouseDown,
+            location: view.convert(localPoint, to: nil),
+            modifierFlags: [],
+            timestamp: 0,
+            windowNumber: window.windowNumber,
+            context: nil,
+            eventNumber: 1,
+            clickCount: 2,
+            pressure: 1))
+        view.mouseDown(with: event)
+
+        XCTAssertEqual(
+            view.copyVirtualSelection(), "copyword",
+            "double-click must keep producing the word selection used by Cmd-C")
+        view.hideFindBar()
+        XCTAssertEqual(view.copyVirtualSelection(), "copyword")
+    }
+
+    func testDragSelectionWorksAfterFindInLargeScrolledSink() throws {
+        let sink = GhosttySink(
+            cols: 40, rows: 5,
+            maxScrollback: GhosttySink.scrollbackBytes(lines: 200_000, cols: 40))
+        let controller = TerminalController(
+            blockId: "11111111-1111-1111-1111-111111111111",
+            tabId: "22222222-2222-2222-2222-222222222222",
+            transport: MockTransport(),
+            sink: sink)
+        let font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
+        let view = GhosttyTerminalView(controller: controller, sink: sink, font: font)
+        let size = NSSize(width: 480, height: 160)
+        let window = NSWindow(
+            contentRect: NSRect(origin: .zero, size: size),
+            styleMask: .borderless, backing: .buffered, defer: false)
+        window.contentView = view
+        view.setFrameSize(size)
+
+        // Keep the target near the oldest retained rows, well away from the active
+        // viewport. This exercises the same displaced sink viewport used by a find
+        // landing in a terminal with substantial output.
+        var output = "find dragword tail\r\n"
+        for line in 0..<12_000 { output += "noise-\(line)\r\n" }
+        sink.feed(Data(output.utf8))
+        sink.withTerminal { terminal in
+            var top = GhosttyTerminalScrollViewport()
+            top.tag = GHOSTTY_SCROLL_VIEWPORT_TOP
+            ghostty_terminal_scroll_viewport(terminal, top)
+        }
+
+        view.showFindBar()
+        XCTAssertTrue(view.markCurrentMatchInVisibleSinkRows(query: "find"))
+
+        let cell = GhosttyTerminalView.measureCell(font: font)
+        func event(_ type: NSEvent.EventType, col: Int) throws -> NSEvent {
+            let localPoint = NSPoint(
+                x: 10 + CGFloat(col) * cell.width + cell.width / 2,
+                y: 4 + cell.height / 2)
+            return try XCTUnwrap(NSEvent.mouseEvent(
+                with: type,
+                location: view.convert(localPoint, to: nil),
+                modifierFlags: [],
+                timestamp: 0,
+                windowNumber: window.windowNumber,
+                context: nil,
+                eventNumber: 1,
+                clickCount: 1,
+                pressure: 1))
+        }
+
+        view.mouseDown(with: try event(.leftMouseDown, col: 5))
+        view.mouseDragged(with: try event(.leftMouseDragged, col: 12))
+        view.mouseUp(with: try event(.leftMouseUp, col: 12))
+
+        XCTAssertEqual(
+            selectionText(in: sink), "dragword",
+            "find state must not consume or replace a drag in displaced live scrollback")
+    }
+
+    private func installSelection(_ cols: ClosedRange<Int>, in sink: GhosttySink) {
+        sink.withTerminal { terminal in
+            func ref(at col: Int) -> GhosttyGridRef? {
+                var point = GhosttyPoint()
+                point.tag = GHOSTTY_POINT_TAG_SCREEN
+                point.value.coordinate = GhosttyPointCoordinate(x: UInt16(col), y: 0)
+                var ref = GhosttyGridRef()
+                ref.size = MemoryLayout<GhosttyGridRef>.stride
+                guard ghostty_terminal_grid_ref(terminal, point, &ref) == GHOSTTY_SUCCESS else { return nil }
+                return ref
+            }
+            guard let start = ref(at: cols.lowerBound), let end = ref(at: cols.upperBound) else {
+                return XCTFail("failed to resolve selection cells")
+            }
+            var selection = GhosttySelection()
+            selection.size = MemoryLayout<GhosttySelection>.stride
+            selection.start = start
+            selection.end = end
+            withUnsafePointer(to: &selection) {
+                XCTAssertEqual(
+                    ghostty_terminal_set(terminal, GHOSTTY_TERMINAL_OPT_SELECTION, $0),
+                    GHOSTTY_SUCCESS)
+            }
+        }
+    }
+
+    private func selectionText(in sink: GhosttySink) -> String? {
+        var result: String?
+        sink.withTerminal { terminal in
+            var opts = GhosttyTerminalSelectionFormatOptions()
+            opts.size = MemoryLayout<GhosttyTerminalSelectionFormatOptions>.stride
+            opts.emit = GHOSTTY_FORMATTER_FORMAT_PLAIN
+            opts.unwrap = true
+            opts.trim = true
+            opts.selection = nil
+            var ptr: UnsafeMutablePointer<UInt8>?
+            var len = 0
+            guard ghostty_terminal_selection_format_alloc(
+                terminal, nil, opts, &ptr, &len) == GHOSTTY_SUCCESS,
+                let ptr, len > 0 else { return }
+            result = String(decoding: UnsafeBufferPointer(start: ptr, count: len), as: UTF8.self)
+            ghostty_free(nil, ptr, len)
+        }
+        return result
+    }
+}
+
+/// A terminal can change DEC mouse-reporting modes between any two output bytes.
+/// One physical gesture must nevertheless stay with the owner chosen on mouseDown,
+/// and Shift must always provide an escape hatch for local text selection.
+final class TerminalPointerGestureTests: XCTestCase {
+    private struct Fixture {
+        let sink: GhosttySink
+        let view: GhosttyTerminalView
+        let window: NSWindow
+        let cell: CGSize
+    }
+
+    private func fixture(text: String = "dragword") -> Fixture {
+        let sink = GhosttySink(cols: 40, rows: 5)
+        let controller = TerminalController(
+            blockId: "11111111-1111-1111-1111-111111111111",
+            tabId: "22222222-2222-2222-2222-222222222222",
+            transport: MockTransport(),
+            sink: sink)
+        let font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
+        let view = GhosttyTerminalView(controller: controller, sink: sink, font: font)
+        let size = NSSize(width: 480, height: 160)
+        let window = NSWindow(
+            contentRect: NSRect(origin: .zero, size: size),
+            styleMask: .borderless, backing: .buffered, defer: false)
+        window.contentView = view
+        view.setFrameSize(size)
+        sink.feed(Data(text.utf8))
+        return Fixture(sink: sink, view: view, window: window,
+                       cell: GhosttyTerminalView.measureCell(font: font))
+    }
+
+    private func event(
+        _ type: NSEvent.EventType, col: Int, row: Int = 0, fixture: Fixture,
+        modifiers: NSEvent.ModifierFlags = [], clickCount: Int = 1
+    ) throws -> NSEvent {
+        let localPoint = NSPoint(
+            x: 10 + CGFloat(col) * fixture.cell.width + fixture.cell.width / 2,
+            y: 4 + CGFloat(row) * fixture.cell.height + fixture.cell.height / 2)
+        return try XCTUnwrap(NSEvent.mouseEvent(
+            with: type,
+            location: fixture.view.convert(localPoint, to: nil),
+            modifierFlags: modifiers,
+            timestamp: 0,
+            windowNumber: fixture.window.windowNumber,
+            context: nil,
+            eventNumber: 1,
+            clickCount: clickCount,
+            pressure: 1))
+    }
+
+    func testLocalDragStaysLocalWhenMouseReportingTurnsOnMidGesture() throws {
+        let f = fixture()
+        f.view.mouseDown(with: try event(.leftMouseDown, col: 0, fixture: f))
+
+        // A streaming app may enable mouse reporting after the press. Re-reading
+        // this mode during drag/up used to steal the rest of Wave's selection.
+        f.sink.feed(Data("\u{1b}[?1000h".utf8))
+        f.view.mouseDragged(with: try event(.leftMouseDragged, col: 7, fixture: f))
+        f.view.mouseUp(with: try event(.leftMouseUp, col: 7, fixture: f))
+
+        XCTAssertEqual(selectionText(in: f.sink), "dragword")
+    }
+
+    func testShiftDragSelectsLocallyWhileApplicationTracksMouse() throws {
+        let f = fixture()
+        f.sink.feed(Data("\u{1b}[?1000h".utf8))
+
+        f.view.mouseDown(with: try event(
+            .leftMouseDown, col: 0, fixture: f, modifiers: .shift))
+        f.view.mouseDragged(with: try event(
+            .leftMouseDragged, col: 7, fixture: f, modifiers: .shift))
+        f.view.mouseUp(with: try event(
+            .leftMouseUp, col: 7, fixture: f, modifiers: .shift))
+
+        XCTAssertEqual(
+            selectionText(in: f.sink), "dragword",
+            "Shift must bypass a real or stale remote mouse-reporting mode")
+    }
+
+    func testSelectionStartsInMiddleOfWrappedRowsAfterRepeatedReflow() throws {
+        let f = fixture(text: "")
+
+        // Long-lived log panes accumulate old pages at several widths. A click on a
+        // visible continuation row must remain addressable after those pages reflow.
+        f.sink.setSize(cols: 80, rows: 5)
+        f.sink.feed(Data(String(repeating: "wrappedword ", count: 2_000).utf8))
+        for cols in [24, 120, 32, 96, 40] {
+            f.sink.setSize(cols: cols, rows: 5)
+        }
+
+        f.view.mouseDown(with: try event(
+            .leftMouseDown, col: 12, row: 2, fixture: f))
+        f.view.mouseDragged(with: try event(
+            .leftMouseDragged, col: 20, row: 2, fixture: f))
+        f.view.mouseUp(with: try event(
+            .leftMouseUp, col: 20, row: 2, fixture: f))
+        XCTAssertNotNil(
+            selectionText(in: f.sink),
+            "a drag beginning away from column zero must survive page reflow")
+
+        f.view.mouseDown(with: try event(
+            .leftMouseDown, col: 15, row: 2, fixture: f, clickCount: 2))
+        XCTAssertEqual(
+            f.view.copyVirtualSelection(), "wrappedword",
+            "double-click in the middle of a wrapped row must resolve a word")
+    }
+
+    private func selectionText(in sink: GhosttySink) -> String? {
+        var result: String?
+        sink.withTerminal { terminal in
+            var opts = GhosttyTerminalSelectionFormatOptions()
+            opts.size = MemoryLayout<GhosttyTerminalSelectionFormatOptions>.stride
+            opts.emit = GHOSTTY_FORMATTER_FORMAT_PLAIN
+            opts.unwrap = true
+            opts.trim = true
+            opts.selection = nil
+            var ptr: UnsafeMutablePointer<UInt8>?
+            var len = 0
+            guard ghostty_terminal_selection_format_alloc(
+                terminal, nil, opts, &ptr, &len) == GHOSTTY_SUCCESS,
+                let ptr, len > 0 else { return }
+            result = String(decoding: UnsafeBufferPointer(start: ptr, count: len), as: UTF8.self)
+            ghostty_free(nil, ptr, len)
+        }
+        return result
+    }
+
+}
+
 /// `isDirectlyEncodedKey` is the gate that keeps control/navigation keys on the direct
 /// `bytes(for:)` encoder while routing ordinary text (incl. dead keys) through the macOS
 /// text-input system. Dead-key composition itself needs a live input context and is
@@ -657,6 +1020,48 @@ final class TerminalCellMetricsTests: XCTestCase {
     }
 }
 
+// Output rendering uses Ghostty's row-level damage and an explicit AppKit visibility
+// gate. Keep the pure range/visibility decisions pinned so a later rendering change
+// cannot silently regress to full-grid work for every terminal chunk.
+final class TerminalRenderDamageTests: XCTestCase {
+    func testDirtyRowsCoalesceIntoMinimalRanges() {
+        XCTAssertEqual(
+            GhosttyTerminalView.coalescedRowRanges([5, 3, 4, 9, 9, -1, 12]),
+            [3..<6, 9..<10, 12..<13])
+        XCTAssertEqual(GhosttyTerminalView.coalescedRowRanges([]), [])
+    }
+
+    func testDirtyRectMapsOnlyToIntersectingGridRows() {
+        XCTAssertEqual(
+            GhosttyTerminalView.drawRowRange(
+                dirtyRect: NSRect(x: 0, y: 14, width: 200, height: 10),
+                padV: 4, cellHeight: 10, rowCount: 5),
+            1..<2)
+        XCTAssertEqual(
+            GhosttyTerminalView.drawRowRange(
+                dirtyRect: NSRect(x: 0, y: 13.5, width: 200, height: 1),
+                padV: 4, cellHeight: 10, rowCount: 5),
+            0..<2,
+            "a rect crossing a row boundary must redraw both rows")
+        XCTAssertEqual(
+            GhosttyTerminalView.drawRowRange(
+                dirtyRect: NSRect(x: 0, y: 60, width: 200, height: 10),
+                padV: 4, cellHeight: 10, rowCount: 5),
+            0..<0)
+    }
+
+    func testInvisibleOrHiddenTerminalSuppressesRendering() {
+        XCTAssertFalse(GhosttyTerminalView.shouldSuppressTerminalRendering(
+            windowVisible: true, hiddenOrHasHiddenAncestor: false))
+        XCTAssertTrue(GhosttyTerminalView.shouldSuppressTerminalRendering(
+            windowVisible: false, hiddenOrHasHiddenAncestor: false),
+            "a fully occluded/minimized/off-Space window must not schedule frames")
+        XCTAssertTrue(GhosttyTerminalView.shouldSuppressTerminalRendering(
+            windowVisible: true, hiddenOrHasHiddenAncestor: true),
+            "a hidden tab/view must not schedule frames")
+    }
+}
+
 // The cursor is a FILLED block only when this view holds key focus AND its window is
 // the key window; otherwise it's HOLLOW. A background window's focused terminal must
 // therefore show a hollow cursor (the regression these assert against).
@@ -737,6 +1142,64 @@ final class TerminalLinkColumnRangeTests: XCTestCase {
         // offset 2; a URL spanning offsets 2..<5 must map to columns 1...3.
         let offsets = [0, 2, 3, 4, 5]
         XCTAssertEqual(GhosttyTerminalView.columnRange(offsets: offsets, utf16Lower: 2, utf16Upper: 5), 1...3)
+    }
+}
+
+// A TUI that dies without its DECRST cleanup (crashed docker exec / ssh) leaves
+// mouse/focus reporting stuck on, flooding the shell prompt with SGR reports. The
+// sink self-heals at the next shell-integration prompt mark (OSC 133;A), and
+// `resetStuckModes` is the manual context-menu escape hatch.
+final class TerminalModeHealTests: XCTestCase {
+    private func modeOn(_ sink: GhosttySink, _ mode: UInt16) -> Bool {
+        var on = false
+        sink.withTerminal { t in
+            _ = ghostty_terminal_mode_get(t, GhosttyMode(mode), &on)
+        }
+        return on
+    }
+
+    func testPromptStartClearsStuckMouseReporting() {
+        let sink = GhosttySink(cols: 40, rows: 5)
+        sink.feed(d("\u{1b}[?1003h\u{1b}[?1006h\u{1b}[?1004h"))
+        XCTAssertTrue(modeOn(sink, 1003))
+        XCTAssertTrue(modeOn(sink, 1004))
+
+        sink.feed(d("\u{1b}]133;A\u{7}$ "))
+        XCTAssertFalse(modeOn(sink, 1003), "any-motion tracking must be cleared at the prompt mark")
+        XCTAssertFalse(modeOn(sink, 1006), "the SGR encoding must not outlive the tracking mode")
+        XCTAssertFalse(modeOn(sink, 1004), "focus reporting must be cleared at the prompt mark")
+    }
+
+    func testEnableAfterPromptMarkSurvives() {
+        // Backfill shape: one chunk replays an old prompt, then the still-running
+        // TUI's mouse enable. The heal must apply AT the mark, not after the chunk.
+        let sink = GhosttySink(cols: 40, rows: 5)
+        sink.feed(d("\u{1b}]133;A\u{7}$ vim\r\u{1b}[?1002h\u{1b}[?1006h"))
+        XCTAssertTrue(modeOn(sink, 1002), "a mouse enable AFTER the prompt mark is live app state")
+        XCTAssertTrue(modeOn(sink, 1006))
+    }
+
+    func testBackfillReplayHealsFinalState() {
+        let sink = GhosttySink(cols: 40, rows: 5)
+        sink.feedBackfill(d("\u{1b}[?1000h\u{1b}]133;A\u{7}$ "))
+        XCTAssertFalse(modeOn(sink, 1000), "replayed history ending at a prompt must not resurrect tracking")
+    }
+
+    func testPromptMarkWithoutStuckModesChangesNothing() {
+        let sink = GhosttySink(cols: 40, rows: 5)
+        sink.feed(d("\u{1b}[?2004h\u{1b}]133;A\u{7}$ "))
+        XCTAssertTrue(modeOn(sink, 2004), "bracketed paste belongs to the shell and must be left alone")
+    }
+
+    func testResetStuckModesRestoresInputState() {
+        let sink = GhosttySink(cols: 40, rows: 5)
+        sink.feed(d("\u{1b}[?1003h\u{1b}[?1049h\u{1b}[?25l"))
+        XCTAssertTrue(modeOn(sink, 1049))
+
+        sink.resetStuckModes()
+        XCTAssertFalse(modeOn(sink, 1003))
+        XCTAssertFalse(modeOn(sink, 1049), "manual reset must leave the alt screen")
+        XCTAssertTrue(modeOn(sink, 25), "manual reset must re-show the cursor")
     }
 }
 #endif

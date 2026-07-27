@@ -9,6 +9,13 @@
 import AppKit
 import WaveCore
 
+/// A visual-only overlay. Transparent pixels in an ordinary `NSView` still win
+/// AppKit hit-testing, so every decoration placed above pane content must use
+/// this type rather than relying on a clear background.
+final class PointerTransparentView: NSView {
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+}
+
 /// Pure mapping of the per-window appearance controls (gear popover) to the AppKit
 /// window values, so the alpha/opaque math is unit-testable without a live NSWindow.
 ///
@@ -83,6 +90,16 @@ final class WaveWindow: NSWindow {
     /// such shortcuts; everything else keeps the "block declines first" ordering.
     var onPreemptKeyEquivalent: ((NSEvent) -> Bool)?
 
+    /// The click that focuses a window is swallowed by AppKit's click-through logic
+    /// (the pane views deliberately reject first mouse, so an activating click can't
+    /// type into a terminal or press a link in a web pane) — but it should still SELECT
+    /// the pane it landed on. `sendEvent` sees the click even when the view won't, and
+    /// routes a focus request to the pane frame under it. A non-key window identifies
+    /// its own activation click via `!isKeyWindow`; on APP re-activation the clicked
+    /// window can already be key again by dispatch time, so the app delegate arms this
+    /// flag on didBecomeActive and the next left-click consumes it.
+    static var appActivationClickPending = false
+
     init(contentRect: NSRect) {
         super.init(
             contentRect: contentRect,
@@ -153,6 +170,15 @@ final class WaveWindow: NSWindow {
     /// we catch it here, and hit-test to a drag region (not a tab/button, which handle their
     /// own double-click, e.g. inline rename) so only the empty strip triggers it.
     override func sendEvent(_ event: NSEvent) {
+        if event.type == .leftMouseDown {
+            // Drag destinations do not receive every cancellation path. Clear a
+            // possibly orphaned content-area ring before `super` hit-tests this
+            // fresh gesture, so one missed draggingEnded can never poison a tab.
+            (contentView as? RootContentView)?.clearBlockDropHighlight()
+            let isActivationClick = !isKeyWindow || Self.appActivationClickPending
+            Self.appActivationClickPending = false
+            if isActivationClick { focusPane(under: event) }
+        }
         if event.type == .leftMouseDown, event.clickCount == 2,
            let hit = contentView?.hitTest(event.locationInWindow),
            hit is TabStripBackgroundView || hit is DragView {
@@ -160,6 +186,21 @@ final class WaveWindow: NSWindow {
             return
         }
         super.sendEvent(event)
+    }
+
+    /// Select the pane frame under an activating click (see `appActivationClickPending`):
+    /// click-through drops the event before the pane's own mouseDown focus path can run,
+    /// so we run the same focus request the click would have. Runs BEFORE super so the
+    /// becomeMain border refresh (`setWindowActive`) already sees the clicked node.
+    private func focusPane(under event: NSEvent) {
+        var view = contentView?.hitTest(event.locationInWindow)
+        while let v = view {
+            if let frame = v as? BlockFrameView {
+                frame.onRequestFocus?(frame.nodeId)
+                return
+            }
+            view = v.superview
+        }
     }
 
     private func performTitleBarDoubleClickAction() {
@@ -203,7 +244,7 @@ final class RootContentView: NSView {
     var onBlockDrop: ((String, String) -> Void)?
     /// Accent ring shown over the content area while a dragged pane hovers it — the
     /// visible "drop here to move the pane into this tab" affordance.
-    private let blockDropHighlight = NSView()
+    private let blockDropHighlight = PointerTransparentView()
 
     /// Apply the window background alpha + blur (driven by `WaveWindow.applyAppearance`).
     /// When translucent the root + content-area layers drop their alpha so the blur /
@@ -442,6 +483,14 @@ final class RootContentView: NSView {
             contentArea.addSubview(blockDropHighlight, positioned: .above, relativeTo: nil)
         }
         blockDropHighlight.isHidden = !on
+    }
+
+    /// Defensive cleanup used before a new physical gesture is dispatched. AppKit can
+    /// omit destination callbacks when a drag is cancelled across windows/spaces.
+    fileprivate func clearBlockDropHighlight() {
+        raiseTimer?.invalidate()
+        raiseTimer = nil
+        setBlockDropHighlight(false)
     }
 
     @available(*, unavailable)

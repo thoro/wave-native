@@ -877,9 +877,8 @@ final class ClosureMenuItem: NSMenuItem {
 }
 
 /// A hover-highlighting clickable row used in the dropdown.
-final class ClickableRow: NSView {
+final class ClickableRow: HoverRowView {
     private let action: () -> Void
-    private var trackingArea: NSTrackingArea?
 
     init(action: @escaping () -> Void) {
         self.action = action
@@ -899,18 +898,9 @@ final class ClickableRow: NSView {
     /// Invoke the row's action programmatically (unit tests have no mouse).
     func performClick() { action() }
 
-    override func updateTrackingAreas() {
-        super.updateTrackingAreas()
-        if let trackingArea { removeTrackingArea(trackingArea) }
-        let area = NSTrackingArea(rect: bounds,
-                                  options: [.mouseEnteredAndExited, .activeInActiveApp, .inVisibleRect],
-                                  owner: self, userInfo: nil)
-        addTrackingArea(area)
-        trackingArea = area
+    override func hoverStateChanged() {
+        layer?.backgroundColor = isHovered ? Theme.hoverBackground.cgColor : NSColor.clear.cgColor
     }
-
-    override func mouseEntered(with event: NSEvent) { layer?.backgroundColor = Theme.hoverBackground.cgColor }
-    override func mouseExited(with event: NSEvent) { layer?.backgroundColor = NSColor.clear.cgColor }
 }
 
 /// A minimal popover with a LEFT-aligned arrow. `NSPopover` always centers its arrow on

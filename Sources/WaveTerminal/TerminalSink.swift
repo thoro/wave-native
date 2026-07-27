@@ -273,6 +273,18 @@ public final class GhosttySink: TerminalSink, @unchecked Sendable {
         cellHeightPx = UInt32(max(0, height))
     }
 
+    /// OSC 133;A "prompt start" prefix (FinalTerm / iTerm2 semantic prompt marks),
+    /// emitted by shell integration on every prompt render. Prefix-matched so
+    /// parameterized forms (`133;A;k=...`) are caught too.
+    private static let promptStartMarker = Data("\u{1b}]133;A".utf8)
+
+    /// DEC private modes that make the terminal report INPUT to the pty: mouse
+    /// tracking (9/1000/1002/1003) and focus events (1004).
+    private static let inputReportModes: [UInt16] = [9, 1000, 1002, 1003, 1004]
+    /// Mouse report encodings (UTF-8/SGR/urxvt/SGR-pixels). Only meaningful while a
+    /// tracking mode is on; cleared alongside so no stale encoding survives.
+    private static let mouseEncodingModes: [UInt16] = [1005, 1006, 1015, 1016]
+
     public func feed(_ bytes: Data) { feed(bytes, replaying: false) }
 
     /// Replay historical (backfilled) bytes WITHOUT producing outward effects — see
@@ -285,9 +297,21 @@ public final class GhosttySink: TerminalSink, @unchecked Sendable {
         lock.lock()
         replaying = replay
         if let t = terminal {
-            bytes.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
-                guard let base = raw.baseAddress else { return }
-                ghostty_terminal_vt_write(t, base.assumingMemoryBound(to: UInt8.self), bytes.count)
+            // Self-heal for crashed TUIs: a program that dies without sending its
+            // DECRST cleanup leaves mouse/focus reporting stuck on, and the shell
+            // prompt then receives every pointer move as SGR mouse reports. A
+            // prompt-start mark while reporting is enabled is that exact
+            // contradiction — no shell consumes mouse reports at its own prompt —
+            // so the stuck modes are cleared at the mark. The chunk is split AT the
+            // last mark so bytes after it (e.g. a backfill replay that ends inside
+            // a live mouse-enabled TUI) re-enable reporting in order. A mark
+            // straddling a chunk boundary is missed; the next prompt heals it.
+            if let cut = bytes.range(of: Self.promptStartMarker, options: .backwards)?.upperBound {
+                Self.vtWrite(t, bytes[bytes.startIndex..<cut])
+                Self.clearStuckReportModes(t)
+                Self.vtWrite(t, bytes[cut...])
+            } else {
+                Self.vtWrite(t, bytes)
             }
         }
         replaying = false
@@ -313,6 +337,50 @@ public final class GhosttySink: TerminalSink, @unchecked Sendable {
         // A `truncate` (circular wrap / clear) maps to a full terminal reset (RIS).
         lock.lock()
         if let t = terminal { ghostty_terminal_reset(t) }
+        lock.unlock()
+        onRender?()
+    }
+
+    private static func vtWrite(_ t: GhosttyTerminal, _ data: Data) {
+        guard !data.isEmpty else { return }
+        data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
+            guard let base = raw.baseAddress else { return }
+            ghostty_terminal_vt_write(t, base.assumingMemoryBound(to: UInt8.self), data.count)
+        }
+    }
+
+    /// Clear stuck input-report modes (see the prompt-start check in `feed`). A
+    /// no-op when none is set — the common case of a prompt after a well-behaved
+    /// program — so per-chunk cost is a few mode reads only when a mark is present.
+    private static func clearStuckReportModes(_ t: GhosttyTerminal) {
+        var stuck = false
+        for m in inputReportModes {
+            var on = false
+            if ghostty_terminal_mode_get(t, GhosttyMode(m), &on) == GHOSTTY_SUCCESS, on {
+                stuck = true
+                break
+            }
+        }
+        guard stuck else { return }
+        for m in inputReportModes + mouseEncodingModes {
+            _ = ghostty_terminal_mode_set(t, GhosttyMode(m), false)
+        }
+    }
+
+    /// Manual "Reset Terminal" escape hatch: restore the input-side modes a crashed
+    /// or misbehaving program can leave stuck, WITHOUT touching buffer contents
+    /// (unlike `clear`, which is a full RIS). DECSTR's spirit: leave the alt
+    /// screen, cursor keys back to normal, origin mode off, all mouse/focus/resize
+    /// reporting off, autowrap and cursor visibility back on. Bracketed paste
+    /// (2004) is deliberately NOT cleared — the live shell legitimately owns it,
+    /// and clearing it would let a paste inject raw newlines.
+    public func resetStuckModes() {
+        lock.lock()
+        if let t = terminal {
+            let off: [UInt16] = [1, 6, 47, 1047, 1049, 2048] + Self.inputReportModes + Self.mouseEncodingModes
+            for m in off { _ = ghostty_terminal_mode_set(t, GhosttyMode(m), false) }
+            for m: UInt16 in [7, 25] { _ = ghostty_terminal_mode_set(t, GhosttyMode(m), true) }
+        }
         lock.unlock()
         onRender?()
     }

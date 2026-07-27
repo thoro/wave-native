@@ -62,11 +62,10 @@ public final class GhosttyTerminalView: NSView {
     /// preedit display in the grid is out of scope; this is logical state only.
     private var markedText = ""
 
-    /// Observers for the owning window's key/non-key transitions. The cursor must go
-    /// hollow when the window stops being key even though this view keeps firstResponder
-    /// (resignFirstResponder does NOT fire on a window deactivation), so we repaint on
-    /// the window notifications. Re-bound in `viewDidMoveToWindow`, torn down in `deinit`.
-    private var windowKeyObservers: [NSObjectProtocol] = []
+    /// Observers for the owning window's key and occlusion transitions. Key changes
+    /// update the cursor; occlusion changes suspend/resume terminal repaint scheduling.
+    /// Re-bound in `viewDidMoveToWindow`, torn down in `deinit`.
+    private var windowStateObservers: [NSObjectProtocol] = []
 
     /// The hyperlink URI under the most recent right-click, captured in `menu(for:)`
     /// so the "Open Link" items act on the clicked cell.
@@ -81,6 +80,9 @@ public final class GhosttyTerminalView: NSView {
     private var fontItalic: NSFont
     private var fontBoldItalic: NSFont
     private var cellSize: CGSize
+    /// Natural glyph advance -> rounded terminal-cell adjustment, lazily cached for the
+    /// four font variants. Used when batching ASCII glyph runs without positional drift.
+    private var glyphKernCache: [ObjectIdentifier: CGFloat] = [:]
 
     /// Terminal background alpha (`term:transparency`: 1 = opaque … 0 = clear). The
     /// default-bg fill + the view layer honour it so the window/desktop shows through.
@@ -110,18 +112,23 @@ public final class GhosttyTerminalView: NSView {
     private var mouseEvent: GhosttyMouseEvent?
     private var mouseButtonDown = false
 
-    // Local drag-selection state (used only when mouse tracking is OFF). The anchor is
-    // held in ABSOLUTE screen coordinates (scrollback-inclusive), NOT viewport cells, so
-    // it survives the viewport scrolling mid-drag — the whole point of being able to drag
-    // (or wheel) up into history while selecting. Storing a viewport cell made the anchor
-    // drift the moment the viewport moved, which broke multi-line selection across
-    // scrollback. Untracked refs are invalidated by any mutation, so both endpoints are
-    // re-resolved to fresh refs inside one lock each tick.
-    private var selectionAnchorScreen: (col: Int, row: Int)?
+    // Local drag-selection state (used only when mouse tracking is OFF). A tracked grid
+    // ref survives viewport scrolling, output, pruning, and resize/reflow while a drag is
+    // in flight. In particular, do not round-trip a visible cell through SCREEN(x,y) and
+    // resolve it again: long-lived, repeatedly reflowed page lists can temporarily reject
+    // that reverse lookup for non-zero columns even though the viewport cell is valid.
+    private var selectionAnchorRef: GhosttyTrackedGridRef?
     private var dragMovedSelection = false
-    /// A multi-click gesture claimed locally while the app has mouse tracking on:
-    /// its drag/up must not be forwarded to the app.
-    private var trackingLocalGesture = false
+    /// Mouse reporting can be toggled by terminal output at any time. Ownership is
+    /// therefore decided once on mouseDown and held through drag/up; re-querying the
+    /// live mode mid-gesture can split one gesture between Wave and the remote app.
+    private enum LeftMouseGestureOwner {
+        case none
+        case local(suppressAutoScroll: Bool)
+        case application
+        case scrollbar
+    }
+    private var leftMouseGestureOwner: LeftMouseGestureOwner = .none
 
     /// Drives continuous auto-scroll while a selection drag is held past the top/bottom
     /// edge (so the user can extend the selection into off-screen history). Carries the
@@ -151,6 +158,26 @@ public final class GhosttyTerminalView: NSView {
     // without touching the underlying glyph.
     private var cursorBlinkTimer: Timer?
     private var cursorBlinkOn = true
+
+    // Terminal output can arrive in very small chunks (and from dozens of panes at once).
+    // Coalesce those signals before they reach the main queue, cap visible invalidations to
+    // the display cadence, and suppress them entirely while this view cannot be seen. The
+    // terminal keeps parsing while suppressed; visibility restoration does one full draw.
+    private let renderSignalLock = NSLock()
+    private var renderWakeScheduled = false       // guarded by renderSignalLock
+    private var renderSuppressed = true           // guarded by renderSignalLock
+    private var renderFlushWorkItem: DispatchWorkItem?
+    private var lastRenderFlushUptime: TimeInterval = 0
+
+    // Cursor viewport position as of the last damage flush. Pure cursor motion
+    // (CUB/CUF/CUP/backspace -- what a shell emits for arrow/word/Home/End
+    // navigation) marks NO row dirty in libghostty: render.h treats the cursor
+    // as a separate layer the renderer redraws every frame. We draw the cursor
+    // as part of the damaged rows instead, so the old and new cursor rows must
+    // be added to the damage by hand or the drawn cursor sticks at its stale cell.
+    private var lastDamageCursorRow = -1
+    private var lastDamageCursorCol = -1
+    private static let minimumRenderInterval: TimeInterval = 1.0 / 60.0
 
     // MARK: virtualized-history state
 
@@ -210,6 +237,15 @@ public final class GhosttyTerminalView: NSView {
     private var searchMatches: [TermSearchMatch] = []
     private var searchIndex = 0
     private var searchTruncated = false
+    /// Start cell of the current find result in the live sink. This is deliberately
+    /// independent of Ghostty's active selection: find is supplemental UI and must
+    /// never replace text the user selected for Copy. A tracked ref keeps the orange
+    /// current-result wash attached to its cell as the terminal scrolls/reflows.
+    private var sinkFindCurrentRef: GhosttyTrackedGridRef?
+    /// The live find query while the find bar is open. Every visible occurrence
+    /// is re-scanned and washed on EACH draw, so highlights stay attached to
+    /// their text when a streaming TUI scrolls the screen.
+    private var findHighlightQuery: String?
     /// Total flushed logical lines reported by the last search (scrollbar domain).
     private var searchTotalLines: Int64 = 0
 
@@ -286,13 +322,7 @@ public final class GhosttyTerminalView: NSView {
         mouseEvent = mev
 
         sink.setCellPixelSize(width: Int(cellSize.width.rounded()), height: Int(cellSize.height.rounded()))
-        sink.onRender = { [weak self] in
-            DispatchQueue.main.async {
-                guard let self else { return }
-                self.needsDisplay = true
-                self.probeSeamIfFrozen()
-            }
-        }
+        sink.onRender = { [weak self] in self?.requestTerminalRender() }
 
         history.attach(controller: controller)
         history.paletteProvider = { [weak sink] in sink?.snapshotPalette() }
@@ -312,8 +342,13 @@ public final class GhosttyTerminalView: NSView {
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
     deinit {
+        renderFlushWorkItem?.cancel()
+        settleHealWorkItem?.cancel()
         cursorBlinkTimer?.invalidate()
-        for token in windowKeyObservers { NotificationCenter.default.removeObserver(token) }
+        autoScrollTimer?.invalidate()
+        for token in windowStateObservers { NotificationCenter.default.removeObserver(token) }
+        clearSelectionAnchor()
+        clearSinkFindCurrent()
         if let mouseEvent { ghostty_mouse_event_free(mouseEvent) }
         if let mouseEncoder { ghostty_mouse_encoder_free(mouseEncoder) }
         if let rowCells { ghostty_render_state_row_cells_free(rowCells) }
@@ -385,6 +420,7 @@ public final class GhosttyTerminalView: NSView {
         fontItalic = fm.convert(base, toHaveTrait: .italicFontMask)
         fontBoldItalic = fm.convert(fm.convert(base, toHaveTrait: .boldFontMask), toHaveTrait: .italicFontMask)
         cellSize = GhosttyTerminalView.measureCell(font: base)
+        glyphKernCache.removeAll(keepingCapacity: true)
     }
 
     // MARK: - Sizing (PROTOCOL §4 resize)
@@ -411,28 +447,83 @@ public final class GhosttyTerminalView: NSView {
 
     public override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
-        observeWindowKeyState()
-        guard window != nil else { return }
+        observeWindowState()
+        updateRenderVisibility()
+        guard window != nil else {
+            resetInFlightPointerGesture()
+            return
+        }
         onDidMoveToWindow?()
         updateTerminalSize()
         window?.makeFirstResponder(self)
     }
 
-    /// (Re)bind the key/resign-key observers to the current window so the cursor
-    /// repaints (filled ↔ hollow) when the window's key state flips. A background
-    /// window's focused terminal must show a hollow cursor even though it still holds
-    /// firstResponder, which only these window-level notifications can detect.
-    private func observeWindowKeyState() {
-        for token in windowKeyObservers { NotificationCenter.default.removeObserver(token) }
-        windowKeyObservers.removeAll()
+    public override func viewDidHide() {
+        super.viewDidHide()
+        resetInFlightPointerGesture()
+        updateRenderVisibility()
+    }
+
+    public override func viewDidUnhide() {
+        super.viewDidUnhide()
+        updateRenderVisibility()
+    }
+
+    /// (Re)bind owning-window state. Key changes repaint the cursor (filled ↔ hollow).
+    /// Occlusion changes are more important: a terminal in a minimized window, another
+    /// Space, or a window fully covered by opaque windows keeps parsing bytes but does no
+    /// render scheduling until it becomes visible again.
+    private func observeWindowState() {
+        for token in windowStateObservers { NotificationCenter.default.removeObserver(token) }
+        windowStateObservers.removeAll()
         guard let window else { return }
         let nc = NotificationCenter.default
         for name in [NSWindow.didBecomeKeyNotification, NSWindow.didResignKeyNotification] {
             let token = nc.addObserver(forName: name, object: window, queue: .main) { [weak self] _ in
-                self?.needsDisplay = true
+                guard let self else { return }
+                if name == NSWindow.didResignKeyNotification {
+                    self.resetInFlightPointerGesture()
+                }
+                self.needsDisplay = true
             }
-            windowKeyObservers.append(token)
+            windowStateObservers.append(token)
         }
+        let occlusionToken = nc.addObserver(
+            forName: NSWindow.didChangeOcclusionStateNotification, object: window, queue: .main
+        ) { [weak self] _ in
+            self?.updateRenderVisibility()
+        }
+        windowStateObservers.append(occlusionToken)
+    }
+
+    /// Synchronize the cross-thread render gate with AppKit visibility. Returning to a
+    /// visible state always requests one full frame, which catches up every terminal
+    /// mutation intentionally ignored while the window was occluded.
+    private func updateRenderVisibility() {
+        let suppressed = Self.shouldSuppressTerminalRendering(
+            windowVisible: window?.occlusionState.contains(.visible) == true,
+            hiddenOrHasHiddenAncestor: isHiddenOrHasHiddenAncestor)
+        renderSignalLock.lock()
+        let changed = renderSuppressed != suppressed
+        renderSuppressed = suppressed
+        if suppressed { renderWakeScheduled = false }
+        renderSignalLock.unlock()
+
+        if !suppressed {
+            if changed { needsDisplay = true }
+        } else {
+            renderFlushWorkItem?.cancel()
+            renderFlushWorkItem = nil
+            settleHealWorkItem?.cancel()
+            settleHealWorkItem = nil
+            updateBlinkTimer(active: false)
+        }
+    }
+
+    static func shouldSuppressTerminalRendering(
+        windowVisible: Bool, hiddenOrHasHiddenAncestor: Bool
+    ) -> Bool {
+        !windowVisible || hiddenOrHasHiddenAncestor
     }
 
     /// Derive the grid size from the view bounds + cell metrics and, if it
@@ -459,6 +550,243 @@ public final class GhosttyTerminalView: NSView {
         needsDisplay = true
     }
 
+    // MARK: - Damage-aware render scheduling
+
+    // Internal (not private) so the damage-consistency test harness can drive the
+    // real collect→paint pipeline with adversarial feed interleavings.
+    enum TerminalDamage {
+        case none
+        case full
+        case rows([Range<Int>])
+    }
+
+    /// Called from the sink's feed thread. Keep at most one main-queue wake outstanding:
+    /// a fast producer may otherwise enqueue thousands of `needsDisplay` closures before
+    /// AppKit gets a chance to coalesce even one frame.
+    private func requestTerminalRender() {
+        renderSignalLock.lock()
+        guard !renderSuppressed, !renderWakeScheduled else {
+            renderSignalLock.unlock()
+            return
+        }
+        renderWakeScheduled = true
+        renderSignalLock.unlock()
+
+        DispatchQueue.main.async { [weak self] in self?.scheduleTerminalDamageFlush() }
+    }
+
+    /// Pace damage collection to at most the display cadence. This is a trailing
+    /// coalescer only when output outruns 60 Hz; an isolated update still renders at once.
+    private func scheduleTerminalDamageFlush() {
+        renderSignalLock.lock()
+        let shouldSchedule = renderWakeScheduled && !renderSuppressed
+        renderSignalLock.unlock()
+        guard shouldSchedule, renderFlushWorkItem == nil else { return }
+
+        let now = ProcessInfo.processInfo.systemUptime
+        let delay = Swift.max(0, Self.minimumRenderInterval - (now - lastRenderFlushUptime))
+        guard delay > 0.0005 else {
+            flushTerminalDamage()
+            return
+        }
+        let work = DispatchWorkItem { [weak self] in self?.flushTerminalDamage() }
+        renderFlushWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
+    }
+
+    private func flushTerminalDamage() {
+        renderFlushWorkItem = nil
+        // Clear the outstanding-wake bit BEFORE reading terminal state. A feed racing
+        // after this point schedules the next frame; a feed before it is included by the
+        // render-state update below.
+        renderSignalLock.lock()
+        renderWakeScheduled = false
+        let suppressed = renderSuppressed
+        renderSignalLock.unlock()
+        guard !suppressed else { return }
+
+        lastRenderFlushUptime = ProcessInfo.processInfo.systemUptime
+        var damage = terminalDamageAndReset()
+        // Self-heal for rare lost partial repaints: the damage pipeline itself is
+        // verified lossless (RenderDamageConsistencyTests fuzzes the collect→draw
+        // race), yet panes occasionally kept stale mixed-frame rows until a full
+        // redraw — an invalidated region dropped at the AppKit/CA layer AFTER the
+        // ghostty dirty flags were cleared, which is unrecoverable per-row. Panes
+        // with a blinking cursor never showed it (the blink timer full-repaints
+        // every 0.53s); non-blinking TUIs like Claude Code did. Escalating one
+        // streaming flush per second to a full frame bounds any such artifact's
+        // lifetime without measurable cost (a full pane repaint is one frame).
+        if case .rows = damage,
+           lastRenderFlushUptime - lastFullInvalidateUptime >= Self.fullRepaintHealInterval {
+            damage = .full
+        }
+        if case .full = damage { lastFullInvalidateUptime = lastRenderFlushUptime }
+        invalidate(damage)
+        scheduleSettleHeal(after: damage)
+        probeSeamIfFrozen()
+    }
+
+    /// Uptime of the last full-frame invalidation issued by the flush path; gates
+    /// the once-per-second heal escalation above.
+    private var lastFullInvalidateUptime: TimeInterval = 0
+    private static let fullRepaintHealInterval: TimeInterval = 1.0
+
+    /// The streaming heal above only fires inside a NEXT flush, so a region dropped on
+    /// the LAST flush of a burst persisted until new output arrived (or a resize). A
+    /// burst-then-idle client with cursor blink disabled — Claude Code — hits exactly
+    /// that window. This one-shot repaints the whole pane once output goes quiet.
+    private var settleHealWorkItem: DispatchWorkItem?
+
+    private func scheduleSettleHeal(after damage: TerminalDamage) {
+        switch damage {
+        case .rows:
+            settleHealWorkItem?.cancel()
+            let work = DispatchWorkItem { [weak self] in
+                guard let self else { return }
+                self.settleHealWorkItem = nil
+                self.renderSignalLock.lock()
+                let suppressed = self.renderSuppressed
+                self.renderSignalLock.unlock()
+                guard !suppressed else { return }
+                self.lastFullInvalidateUptime = ProcessInfo.processInfo.systemUptime
+                self.needsDisplay = true
+            }
+            settleHealWorkItem = work
+            DispatchQueue.main.asyncAfter(
+                deadline: .now() + Self.fullRepaintHealInterval, execute: work)
+        case .full:
+            // The frame just painted whole; a pending heal from an earlier partial
+            // flush is redundant. `.none` intentionally leaves any pending heal armed.
+            settleHealWorkItem?.cancel()
+            settleHealWorkItem = nil
+        case .none:
+            break
+        }
+    }
+
+    /// Update Ghostty's persistent render snapshot, read its global/per-row damage, then
+    /// clear BOTH dirty layers as required by render.h. `draw(_:)` can safely read the
+    /// resulting snapshot later because all render-state updates happen on the main thread.
+    func terminalDamageAndReset() -> TerminalDamage {
+        var result: TerminalDamage = .full
+        sink.withTerminal { [weak self] terminal in
+            guard let self, let state = self.renderState,
+                  ghostty_render_state_update(state, terminal) == GHOSTTY_SUCCESS else { return }
+
+            var dirty = GHOSTTY_RENDER_STATE_DIRTY_FULL
+            guard ghostty_render_state_get(
+                state, GHOSTTY_RENDER_STATE_DATA_DIRTY, &dirty) == GHOSTTY_SUCCESS else { return }
+
+            var dirtyRows: [Int] = []
+            if var it = self.rowIterator,
+               ghostty_render_state_get(
+                state, GHOSTTY_RENDER_STATE_DATA_ROW_ITERATOR, &it) == GHOSTTY_SUCCESS {
+                var row = 0
+                while ghostty_render_state_row_iterator_next(it) {
+                    var rowDirty = false
+                    if ghostty_render_state_row_get(
+                        it, GHOSTTY_RENDER_STATE_ROW_DATA_DIRTY, &rowDirty) == GHOSTTY_SUCCESS,
+                       rowDirty {
+                        dirtyRows.append(row)
+                    }
+                    var clean = false
+                    _ = ghostty_render_state_row_set(
+                        it, GHOSTTY_RENDER_STATE_ROW_OPTION_DIRTY, &clean)
+                    row += 1
+                }
+            }
+
+            var cursorInViewport = false
+            ghostty_render_state_get(
+                state, GHOSTTY_RENDER_STATE_DATA_CURSOR_VIEWPORT_HAS_VALUE, &cursorInViewport)
+            var curRow = -1
+            var curCol = -1
+            if cursorInViewport {
+                var cx: UInt16 = 0
+                var cy: UInt16 = 0
+                ghostty_render_state_get(state, GHOSTTY_RENDER_STATE_DATA_CURSOR_VIEWPORT_X, &cx)
+                ghostty_render_state_get(state, GHOSTTY_RENDER_STATE_DATA_CURSOR_VIEWPORT_Y, &cy)
+                curRow = Int(cy)
+                curCol = Int(cx)
+            }
+            if curRow != self.lastDamageCursorRow || curCol != self.lastDamageCursorCol {
+                if self.lastDamageCursorRow >= 0 { dirtyRows.append(self.lastDamageCursorRow) }
+                if curRow >= 0 { dirtyRows.append(curRow) }
+                self.lastDamageCursorRow = curRow
+                self.lastDamageCursorCol = curCol
+            }
+
+            switch dirty {
+            case GHOSTTY_RENDER_STATE_DIRTY_FALSE:
+                result = dirtyRows.isEmpty ? .none : .rows(Self.coalescedRowRanges(dirtyRows))
+            case GHOSTTY_RENDER_STATE_DIRTY_PARTIAL:
+                result = dirtyRows.isEmpty ? .full : .rows(Self.coalescedRowRanges(dirtyRows))
+            default:
+                result = .full
+            }
+
+            var cleanState = GHOSTTY_RENDER_STATE_DIRTY_FALSE
+            _ = ghostty_render_state_set(
+                state, GHOSTTY_RENDER_STATE_OPTION_DIRTY, &cleanState)
+        }
+        return result
+    }
+
+    /// Merge sorted row indexes into the smallest set of half-open ranges. Internal for
+    /// focused tests of the damage geometry without requiring a live NSWindow.
+    static func coalescedRowRanges(_ rows: [Int]) -> [Range<Int>] {
+        let sorted = Array(Set(rows.filter { $0 >= 0 })).sorted()
+        guard let first = sorted.first else { return [] }
+        var ranges: [Range<Int>] = []
+        var lo = first
+        var hi = first + 1
+        for row in sorted.dropFirst() {
+            if row == hi {
+                hi += 1
+            } else {
+                ranges.append(lo..<hi)
+                lo = row
+                hi = row + 1
+            }
+        }
+        ranges.append(lo..<hi)
+        return ranges
+    }
+
+    private func invalidate(_ damage: TerminalDamage) {
+        switch damage {
+        case .none:
+            return
+        case .full:
+            needsDisplay = true
+        case .rows(let ranges):
+            // The paged-history seam changes the mapping between sink rows and draw rows;
+            // it is uncommon during streaming and safer to redraw as one coherent frame.
+            guard histRowsOnScreen == 0 else {
+                needsDisplay = true
+                return
+            }
+            for range in ranges {
+                let lo = Swift.max(0, Swift.min(lastRows, range.lowerBound))
+                let hi = Swift.max(lo, Swift.min(lastRows, range.upperBound))
+                guard hi > lo else { continue }
+                let rect = NSRect(
+                    x: 0,
+                    y: padV + CGFloat(lo) * cellSize.height,
+                    width: bounds.width,
+                    height: CGFloat(hi - lo) * cellSize.height)
+                let clippedRect = rect.intersection(bounds)
+                guard !clippedRect.isNull, !clippedRect.isEmpty else { continue }
+                setNeedsDisplay(clippedRect)
+            }
+            if scrollbarVisible {
+                setNeedsDisplay(NSRect(
+                    x: Swift.max(0, bounds.width - Self.scrollbarWidth), y: 0,
+                    width: Self.scrollbarWidth, height: bounds.height))
+            }
+        }
+    }
+
     // MARK: - Rendering (render.h snapshot -> CoreText)
 
     private struct CellSnapshot {
@@ -478,8 +806,15 @@ public final class GhosttyTerminalView: NSView {
     public override func draw(_ dirtyRect: NSRect) {
         var defaultBg = NSColor.black
         var defaultFg = NSColor(white: 0.76, alpha: 1)
+        let histOnScreen = histRowsOnScreen
+        let dirtyDrawRows = Self.drawRowRange(
+            dirtyRect: dirtyRect, padV: padV,
+            cellHeight: cellSize.height, rowCount: lastRows)
         var grid: [[CellSnapshot]] = []
         var selRanges: [ClosedRange<Int>?] = []
+        let findNeedle = findHighlightQuery
+        var sinkFindCols: [[ClosedRange<Int>]] = []
+        var sinkFindCurrentPoint: (col: Int, row: Int)?
         var cursorVisible = false
         var cursorInViewport = false
         var cursorX = 0
@@ -499,6 +834,14 @@ public final class GhosttyTerminalView: NSView {
                 sinkSbTotal = Int(sb.total)
             }
             guard ghostty_render_state_update(state, terminal) == GHOSTTY_SUCCESS else { return }
+
+            if let currentRef = self.sinkFindCurrentRef {
+                var point = GhosttyPointCoordinate()
+                if ghostty_tracked_grid_ref_point(
+                    currentRef, GHOSTTY_POINT_TAG_VIEWPORT, &point) == GHOSTTY_SUCCESS {
+                    sinkFindCurrentPoint = (Int(point.x), Int(point.y))
+                }
+            }
 
             var colors = GhosttyRenderStateColors()
             colors.size = MemoryLayout<GhosttyRenderStateColors>.stride
@@ -524,6 +867,13 @@ public final class GhosttyTerminalView: NSView {
             guard var it = self.rowIterator, var cells = self.rowCells else { return }
             ghostty_render_state_get(state, GHOSTTY_RENDER_STATE_DATA_ROW_ITERATOR, &it)
             while ghostty_render_state_row_iterator_next(it) {
+                let sinkRow = grid.count
+                guard dirtyDrawRows.contains(sinkRow + histOnScreen) else {
+                    grid.append([])
+                    selRanges.append(nil)
+                    sinkFindCols.append([])
+                    continue
+                }
                 var rowSel = GhosttyRenderStateRowSelection()
                 rowSel.size = MemoryLayout<GhosttyRenderStateRowSelection>.stride
                 if ghostty_render_state_row_get(it, GHOSTTY_RENDER_STATE_ROW_DATA_SELECTION, &rowSel) == GHOSTTY_SUCCESS {
@@ -533,9 +883,17 @@ public final class GhosttyTerminalView: NSView {
                 }
                 guard ghostty_render_state_row_get(it, GHOSTTY_RENDER_STATE_ROW_DATA_CELLS, &cells) == GHOSTTY_SUCCESS else {
                     grid.append([])
+                    sinkFindCols.append([])
                     continue
                 }
                 grid.append(GhosttyTerminalView.snapshotRow(cells: cells, defaultFg: defaultFg, defaultBg: defaultBg))
+                if let findNeedle,
+                   ghostty_render_state_row_get(it, GHOSTTY_RENDER_STATE_ROW_DATA_CELLS, &cells) == GHOSTTY_SUCCESS {
+                    let (line, offsets) = GhosttyTerminalView.rowLine(cells: cells)
+                    sinkFindCols.append(GhosttyTerminalView.findOccurrenceCols(line: line, offsets: offsets, needle: findNeedle))
+                } else {
+                    sinkFindCols.append([])
+                }
             }
         }
 
@@ -545,9 +903,6 @@ public final class GhosttyTerminalView: NSView {
         let filled = GhosttyTerminalView.cursorIsFilled(
             hasKeyFocus: hasKeyFocus, windowIsKey: window?.isKeyWindow ?? false)
         cursorStyle = GhosttyTerminalView.resolvedCursorStyle(reported: cursorStyle, filled: filled)
-
-        // In history mode the cursor lives below the visible window; suppress it.
-        let histOnScreen = histRowsOnScreen
 
         // Blink only when the focused pane's TUI requested it (render.h CURSOR_BLINKING,
         // driven by DEC mode 12). The timer runs solely while a blink is wanted; on a
@@ -559,7 +914,7 @@ public final class GhosttyTerminalView: NSView {
         // Paint the snapshot (no terminal access below this line). Honor the terminal
         // background alpha (`term:transparency`) so the window/blur shows through.
         defaultBg.withAlphaComponent(backgroundAlpha).setFill()
-        bounds.fill()
+        dirtyRect.fill()
 
         let cw = cellSize.width
         let ch = cellSize.height
@@ -568,21 +923,36 @@ public final class GhosttyTerminalView: NSView {
         // chunks draw as blank rows until their parse lands (row(at:) kicks it).
         let totalHist = history.totalRows()
         let firstHistRow = totalHist - Swift.min(historyScrollRows, totalHist)
-        for r in 0..<histOnScreen {
+        for r in 0..<histOnScreen where dirtyDrawRows.contains(r) {
             let globalRow = firstHistRow + r
             guard let hrow = history.row(at: globalRow) else { continue }
             let y = padV + CGFloat(r) * ch
             let selCols = virtualSelectionCols(historyGlobalRow: globalRow, textWidth: Swift.max(hrow.cells.count, hrow.offsets.count))
             let highlightCols = historyHighlight?.rowIndex == globalRow ? historyHighlight?.cols : nil
+            let findCols = findNeedle.map {
+                GhosttyTerminalView.findOccurrenceCols(line: hrow.plain, offsets: hrow.offsets, needle: $0)
+            } ?? []
             let width = Swift.min(lastCols, Swift.max(hrow.cells.count, 1))
+            var glyphs: [GlyphPaint] = []
+            glyphs.reserveCapacity(width)
             for col in 0..<width {
                 let rect = NSRect(x: padH + CGFloat(col) * cw, y: y, width: cw, height: ch)
-                let selected = (selCols?.contains(col) ?? false) || (highlightCols?.contains(col) ?? false)
-                drawCell(
+                let find: FindMark? = if highlightCols?.contains(col) == true {
+                    .current
+                } else if findCols.contains(where: { $0.contains(col) }) {
+                    .match
+                } else {
+                    nil
+                }
+                let selected = selCols?.contains(col) ?? false
+                if let glyph = paintCellChrome(
                     historyCellSnapshot(hrow, col: col, defaultFg: defaultFg),
                     in: rect, cursor: nil, cursorColor: cursorColor,
-                    defaultBg: defaultBg, selected: selected)
+                    defaultBg: defaultBg, selected: selected, find: find) {
+                    glyphs.append(glyph)
+                }
             }
+            drawGlyphs(glyphs)
         }
 
         for (row, line) in grid.enumerated() {
@@ -601,18 +971,37 @@ public final class GhosttyTerminalView: NSView {
             } else {
                 rowSel = nil
             }
+            let findCols = row < sinkFindCols.count ? sinkFindCols[row] : []
+            let currentFindCols = sinkFindCurrentPoint.flatMap { point in
+                point.row == row ? findCols.first(where: { $0.contains(point.col) }) : nil
+            }
+            var glyphs: [GlyphPaint] = []
+            glyphs.reserveCapacity(line.count)
             for (col, cell) in line.enumerated() {
                 let rect = NSRect(x: padH + CGFloat(col) * cw, y: y, width: cw, height: ch)
                 let isCursorCell = showCursor && col == cursorX && row == cursorY
+                let find: FindMark? = if findCols.contains(where: { $0.contains(col) }) {
+                    currentFindCols?.contains(col) == true ? .current : .match
+                } else {
+                    nil
+                }
                 let selected = rowSel?.contains(col) ?? false
-                drawCell(cell, in: rect, cursor: isCursorCell ? cursorStyle : nil, cursorColor: cursorColor, defaultBg: defaultBg, selected: selected)
+                if let glyph = paintCellChrome(
+                    cell, in: rect, cursor: isCursorCell ? cursorStyle : nil,
+                    cursorColor: cursorColor, defaultBg: defaultBg,
+                    selected: selected, find: find) {
+                    glyphs.append(glyph)
+                }
             }
+            drawGlyphs(glyphs)
         }
 
         // Cmd-hover link underline, drawn from the same snapshot (no terminal access here).
         // Each spanned cell is underlined in its own fg so a colored link stays consistent.
         // hoverLink.row is a DRAW row: a history row when < histOnScreen, else a sink row.
-        if let hoverLink, hoverLink.row >= 0, hoverLink.row < lastRows {
+        if let hoverLink,
+           hoverLink.row >= 0, hoverLink.row < lastRows,
+           dirtyDrawRows.contains(hoverLink.row) {
             let yUnderline = padV + CGFloat(hoverLink.row) * ch + ch - 2
             if hoverLink.row < histOnScreen {
                 if let hrow = history.row(at: firstHistRow + hoverLink.row) {
@@ -632,6 +1021,21 @@ public final class GhosttyTerminalView: NSView {
         }
 
         drawScrollbar(sinkOffset: sinkSbOffset, sinkTotal: sinkSbTotal)
+    }
+
+    /// Grid rows intersecting an AppKit dirty rect. A per-row terminal update should not
+    /// snapshot or lay out glyphs for every clean row merely because the view is layer-backed.
+    static func drawRowRange(
+        dirtyRect: NSRect, padV: CGFloat, cellHeight: CGFloat, rowCount: Int
+    ) -> Range<Int> {
+        guard rowCount > 0, cellHeight > 0,
+              dirtyRect.maxY > padV,
+              dirtyRect.minY < padV + CGFloat(rowCount) * cellHeight else { return 0..<0 }
+        let first = Int(((dirtyRect.minY - padV) / cellHeight).rounded(.down))
+        let end = Int(((dirtyRect.maxY - padV) / cellHeight).rounded(.up))
+        let lo = Swift.max(0, Swift.min(rowCount, first))
+        let hi = Swift.max(lo, Swift.min(rowCount, end))
+        return lo..<hi
     }
 
     /// Columns of a HISTORY row covered by the virtual selection (nil = none).
@@ -684,14 +1088,57 @@ public final class GhosttyTerminalView: NSView {
         return font
     }
 
-    private func drawCell(
+    /// Find-highlight kind for a cell: `.match` = any visible occurrence of the
+    /// query (yellow), `.current` = the occurrence the find bar is on (orange).
+    enum FindMark {
+        case match
+        case current
+    }
+
+    /// Back-to-front overlay order. Find is supplemental, so the caret remains
+    /// visible above it and the user's selection remains the topmost wash.
+    enum CellOverlayKind: Equatable {
+        case find
+        case cursor
+        case selection
+    }
+
+    static func cellOverlayOrder(hasFind: Bool, hasCursor: Bool, selected: Bool) -> [CellOverlayKind] {
+        var result: [CellOverlayKind] = []
+        if hasFind { result.append(.find) }
+        if hasCursor { result.append(.cursor) }
+        if selected { result.append(.selection) }
+        return result
+    }
+
+    static let findMatchColor = NSColor(srgbRed: 1.0, green: 0.85, blue: 0.25, alpha: 1)
+    static let findCurrentColor = NSColor(srgbRed: 1.0, green: 0.56, blue: 0.13, alpha: 1)
+
+    private struct GlyphPaint {
+        let text: String
+        let point: NSPoint
+        let font: NSFont
+        let color: NSColor
+
+        var isBatchableASCII: Bool {
+            guard font.isFixedPitch,
+                  text.utf8.count == 1, let byte = text.utf8.first else { return false }
+            return byte >= 0x21 && byte <= 0x7e
+        }
+    }
+
+    /// Paint cell backgrounds/overlays/decorations immediately, but return the glyph for
+    /// a row-level batching pass. Keeping chrome cell-precise preserves cursor, selection,
+    /// search, and SGR behavior while avoiding one AppKit layout call per ASCII character.
+    private func paintCellChrome(
         _ cell: CellSnapshot,
         in rect: NSRect,
         cursor: GhosttyRenderStateCursorVisualStyle?,
         cursorColor: NSColor,
         defaultBg: NSColor,
-        selected: Bool
-    ) {
+        selected: Bool,
+        find: FindMark? = nil
+    ) -> GlyphPaint? {
         // Resolve fg/bg, honoring SGR inverse (swap) and faint (dim fg).
         var glyphColor = cell.fg
         var fillColor = cell.bg
@@ -706,33 +1153,44 @@ public final class GhosttyTerminalView: NSView {
             rect.fill()
         }
 
-        if let cursor {
-            switch cursor {
-            case GHOSTTY_RENDER_STATE_CURSOR_VISUAL_STYLE_BLOCK:
-                cursorColor.setFill()
+        for overlay in Self.cellOverlayOrder(
+            hasFind: find != nil, hasCursor: cursor != nil, selected: selected) {
+            switch overlay {
+            case .find:
+                guard let find else { continue }
+                // Opaque wash + forced-dark glyph so a result reads against any
+                // terminal color. Cursor and selection are painted above this.
+                (find == .current ? Self.findCurrentColor : Self.findMatchColor).setFill()
                 rect.fill()
-                glyphColor = defaultBg // glyph drawn in the background color over the block
-            case GHOSTTY_RENDER_STATE_CURSOR_VISUAL_STYLE_BLOCK_HOLLOW:
-                cursorColor.setStroke()
-                let p = NSBezierPath(rect: rect.insetBy(dx: 0.5, dy: 0.5))
-                p.lineWidth = 1
-                p.stroke()
-            case GHOSTTY_RENDER_STATE_CURSOR_VISUAL_STYLE_BAR:
-                cursorColor.setFill()
-                NSRect(x: rect.minX, y: rect.minY, width: 2, height: rect.height).fill()
-            case GHOSTTY_RENDER_STATE_CURSOR_VISUAL_STYLE_UNDERLINE:
-                cursorColor.setFill()
-                NSRect(x: rect.minX, y: rect.maxY - 2, width: rect.width, height: 2).fill()
-            default:
-                break
+                // Once selected, the cell belongs visually to the selection too;
+                // keep its normal glyph color (important for opaque dark themes).
+                if !selected { glyphColor = .black }
+            case .cursor:
+                guard let cursor else { continue }
+                switch cursor {
+                case GHOSTTY_RENDER_STATE_CURSOR_VISUAL_STYLE_BLOCK:
+                    cursorColor.setFill()
+                    rect.fill()
+                    glyphColor = defaultBg // glyph drawn in the background color over the block
+                case GHOSTTY_RENDER_STATE_CURSOR_VISUAL_STYLE_BLOCK_HOLLOW:
+                    cursorColor.setStroke()
+                    let p = NSBezierPath(rect: rect.insetBy(dx: 0.5, dy: 0.5))
+                    p.lineWidth = 1
+                    p.stroke()
+                case GHOSTTY_RENDER_STATE_CURSOR_VISUAL_STYLE_BAR:
+                    cursorColor.setFill()
+                    NSRect(x: rect.minX, y: rect.minY, width: 2, height: rect.height).fill()
+                case GHOSTTY_RENDER_STATE_CURSOR_VISUAL_STYLE_UNDERLINE:
+                    cursorColor.setFill()
+                    NSRect(x: rect.minX, y: rect.maxY - 2, width: rect.width, height: 2).fill()
+                default:
+                    break
+                }
+            case .selection:
+                // User-owned selection is always the topmost wash.
+                (selectionColorOverride ?? Self.selectionColor).setFill()
+                rect.fill()
             }
-        }
-
-        // Selection wash: over the resolved bg/cursor fill, under the glyph. A theme's
-        // `selectionBackground` overrides the default translucent white wash.
-        if selected {
-            (selectionColorOverride ?? GhosttyTerminalView.selectionColor).setFill()
-            rect.fill()
         }
 
         // Text decorations (drawn in the glyph color, even for blank cells).
@@ -749,12 +1207,71 @@ public final class GhosttyTerminalView: NSView {
             NSRect(x: rect.minX, y: rect.minY, width: rect.width, height: 1).fill()
         }
 
-        guard !cell.invisible, !cell.text.isEmpty, cell.text != " " else { return }
+        guard !cell.invisible, !cell.text.isEmpty, cell.text != " " else { return nil }
+        return GlyphPaint(
+            text: cell.text,
+            point: NSPoint(x: rect.minX, y: rect.minY),
+            font: font(bold: cell.bold, italic: cell.italic),
+            color: glyphColor)
+    }
+
+    private func drawGlyphs(_ glyphs: [GlyphPaint]) {
+        var index = 0
+        while index < glyphs.count {
+            let first = glyphs[index]
+            guard first.isBatchableASCII else {
+                drawGlyph(first.text, at: first.point, font: first.font, color: first.color, kern: nil)
+                index += 1
+                continue
+            }
+
+            var end = index + 1
+            var expectedX = first.point.x + cellSize.width
+            while end < glyphs.count {
+                let next = glyphs[end]
+                guard next.isBatchableASCII,
+                      next.font === first.font,
+                      next.color.isEqual(first.color),
+                      abs(next.point.y - first.point.y) < 0.01,
+                      abs(next.point.x - expectedX) < 0.01 else { break }
+                expectedX += cellSize.width
+                end += 1
+            }
+
+            if end - index == 1 {
+                drawGlyph(first.text, at: first.point, font: first.font, color: first.color, kern: nil)
+            } else {
+                let text = glyphs[index..<end].map(\.text).joined()
+                drawGlyph(
+                    text, at: first.point, font: first.font, color: first.color,
+                    kern: glyphKern(for: first.font))
+            }
+            index = end
+        }
+    }
+
+    private func glyphKern(for font: NSFont) -> CGFloat {
+        let key = ObjectIdentifier(font)
+        if let cached = glyphKernCache[key] { return cached }
         let attrs: [NSAttributedString.Key: Any] = [
-            .font: font(bold: cell.bold, italic: cell.italic),
-            .foregroundColor: glyphColor,
+            .font: font,
         ]
-        (cell.text as NSString).draw(at: NSPoint(x: rect.minX, y: rect.minY), withAttributes: attrs)
+        let naturalAdvance = ("M" as NSString).size(withAttributes: attrs).width
+        let kern = cellSize.width - naturalAdvance
+        glyphKernCache[key] = kern
+        return kern
+    }
+
+    private func drawGlyph(
+        _ text: String, at point: NSPoint, font: NSFont, color: NSColor, kern: CGFloat?
+    ) {
+        var attrs: [NSAttributedString.Key: Any] = [
+            .font: font,
+            .foregroundColor: color,
+            .ligature: 0,
+        ]
+        if let kern { attrs[.kern] = kern }
+        (text as NSString).draw(at: point, withAttributes: attrs)
     }
 
     // MARK: - Scrollback (render.h viewport)
@@ -784,12 +1301,15 @@ public final class GhosttyTerminalView: NSView {
         scrollUnified(rows: rows)
         // A native drag whose wheel-scroll crossed into history converts to a
         // virtual selection so it keeps extending across the seam.
-        if virtualSelection == nil, selectionAnchorScreen != nil, historyScrollRows > 0 {
+        if virtualSelection == nil, selectionAnchorRef != nil, historyScrollRows > 0 {
             convertNativeSelectionToVirtual()
         }
         // Mid drag-selection: keep the selection end pinned under the pointer as the
         // viewport scrolls, so wheel-scrolling up extends the selection into history.
-        if let win = window, virtualSelection != nil || selectionAnchorScreen != nil {
+        // Gated on the button actually being held -- a completed selection (e.g. a
+        // double-click word) must not grow when the user merely scrolls afterwards.
+        let leftButtonHeld = NSEvent.pressedMouseButtons & 1 != 0
+        if let win = window, leftButtonHeld, virtualSelection != nil || selectionAnchorRef != nil {
             let loc = convert(win.mouseLocationOutsideOfEventStream, from: nil)
             let col = min(max(Int((loc.x - padH) / cellSize.width), 0), max(0, lastCols - 1))
             let row = min(max(Int((loc.y - padV) / cellSize.height), 0), max(0, lastRows - 1))
@@ -1166,21 +1686,23 @@ public final class GhosttyTerminalView: NSView {
         searchMatches = []
         searchTruncated = false
         historyHighlight = nil
-        sink.withTerminal { terminal in
-            ghostty_terminal_set(terminal, GHOSTTY_TERMINAL_OPT_SELECTION, nil)
-        }
+        findHighlightQuery = nil
+        clearSinkFindCurrent()
         window?.makeFirstResponder(self)
         needsDisplay = true
     }
 
     private func scheduleSearch(_ query: String) {
         findDebounce?.cancel()
+        jumpTask?.cancel()
         historyHighlight = nil
+        clearSinkFindCurrent()
+        findHighlightQuery = query.isEmpty ? nil : query
+        needsDisplay = true
         guard !query.isEmpty else {
             searchMatches = []
             searchTruncated = false
             findBar?.setCount(current: 0, total: 0, truncated: false)
-            needsDisplay = true
             return
         }
         findDebounce = Task { @MainActor [weak self] in
@@ -1235,6 +1757,7 @@ public final class GhosttyTerminalView: NSView {
                 self.historyScrollRows = Swift.max(1, Swift.min(total, total - hit.row + self.lastRows / 2))
                 self.rememberTopAnchor()
                 self.historyHighlight = (hit.row, hit.cols)
+                self.clearSinkFindCurrent()
                 self.needsDisplay = true
                 return
             }
@@ -1242,7 +1765,7 @@ public final class GhosttyTerminalView: NSView {
             // In the sink layer: scroll to the match line's fraction and verify.
             self.exitHistory()
             self.scrollSinkToLine(match.line)
-            if !self.highlightInVisibleSinkRows(query: query) {
+            if !self.markCurrentMatchInVisibleSinkRows(query: query) {
                 self.pageWalkSinkToQuery(query)
             }
             self.needsDisplay = true
@@ -1270,13 +1793,12 @@ public final class GhosttyTerminalView: NSView {
         }
     }
 
-    /// Find the query in the currently visible sink rows and select it natively
-    /// (the existing selection wash becomes the match highlight). Returns
-    /// whether the query was found on screen.
+    /// Find the query in the currently visible sink rows and remember its start
+    /// independently of the user's active selection. Returns whether the query
+    /// was found on screen.
     @discardableResult
-    private func highlightInVisibleSinkRows(query: String) -> Bool {
+    func markCurrentMatchInVisibleSinkRows(query: String) -> Bool {
         guard !query.isEmpty else { return false }
-        let needle = query.lowercased()
         var found = false
         sink.withTerminal { [weak self] terminal in
             guard let self, let state = self.renderState,
@@ -1288,17 +1810,16 @@ public final class GhosttyTerminalView: NSView {
                 defer { rowIdx += 1 }
                 guard ghostty_render_state_row_get(it, GHOSTTY_RENDER_STATE_ROW_DATA_CELLS, &cells) == GHOSTTY_SUCCESS else { continue }
                 let (line, offsets) = GhosttyTerminalView.rowLine(cells: cells)
-                guard let r = line.lowercased().range(of: needle) else { continue }
-                let lowerOff = line.utf16.distance(from: line.utf16.startIndex, to: r.lowerBound.samePosition(in: line.utf16) ?? line.utf16.startIndex)
-                let upperOff = line.utf16.distance(from: line.utf16.startIndex, to: r.upperBound.samePosition(in: line.utf16) ?? line.utf16.endIndex)
-                guard let cols = GhosttyTerminalView.columnRange(offsets: offsets, utf16Lower: lowerOff, utf16Upper: upperOff),
-                      let s = self.gridRef(terminal, col: cols.lowerBound, row: rowIdx),
-                      let e = self.gridRef(terminal, col: cols.upperBound, row: rowIdx) else { return }
-                var sel = GhosttySelection()
-                sel.size = MemoryLayout<GhosttySelection>.stride
-                sel.start = s
-                sel.end = e
-                withUnsafePointer(to: &sel) { _ = ghostty_terminal_set(terminal, GHOSTTY_TERMINAL_OPT_SELECTION, $0) }
+                guard let cols = GhosttyTerminalView.findOccurrenceCols(
+                    line: line, offsets: offsets, needle: query).first else { continue }
+                var point = GhosttyPoint()
+                point.tag = GHOSTTY_POINT_TAG_VIEWPORT
+                point.value.coordinate = GhosttyPointCoordinate(
+                    x: UInt16(cols.lowerBound), y: UInt32(rowIdx))
+                var ref: GhosttyTrackedGridRef?
+                guard ghostty_terminal_grid_ref_track(terminal, point, &ref) == GHOSTTY_SUCCESS,
+                      let ref else { return }
+                self.replaceSinkFindCurrentLocked(with: ref)
                 found = true
                 return
             }
@@ -1320,10 +1841,25 @@ public final class GhosttyTerminalView: NSView {
                 let target = Swift.max(0, Swift.min(start.total - start.len, start.offset + dir * start.len))
                 guard target != start.offset else { continue }
                 scrollSink(toOffset: target)
-                if highlightInVisibleSinkRows(query: query) { return }
+                if markCurrentMatchInVisibleSinkRows(query: query) { return }
             }
         }
         scrollSink(toOffset: start.offset)
+    }
+
+    /// Replace/free the live current-result anchor without touching selection.
+    /// Caller must hold the sink's terminal lock.
+    private func replaceSinkFindCurrentLocked(with ref: GhosttyTrackedGridRef?) {
+        if let old = sinkFindCurrentRef { ghostty_tracked_grid_ref_free(old) }
+        sinkFindCurrentRef = ref
+    }
+
+    private func clearSinkFindCurrent() {
+        guard let ref = sinkFindCurrentRef else { return }
+        sinkFindCurrentRef = nil
+        // Tracked refs participate in terminal mutation bookkeeping, so serialize
+        // their destruction with feed/resize/render access too.
+        sink.withTerminal { _ in ghostty_tracked_grid_ref_free(ref) }
     }
 
     private func sinkScrollbarState() -> (offset: Int, len: Int, total: Int)? {
@@ -1460,25 +1996,35 @@ public final class GhosttyTerminalView: NSView {
     // MARK: - Mouse (selection.h drag/copy + mouse/encoder.h reporting)
 
     public override func mouseDown(with event: NSEvent) {
+        // AppKit can omit mouseUp when a window resigns, a tab disappears, or a drag
+        // changes owner. A fresh press is an unconditional recovery boundary: discard
+        // only transient gesture state, never the user's completed selection.
+        resetInFlightPointerGesture()
         // Any click focuses this pane (green border + keyboard focus), even for a
         // mouse-tracking app that consumes the event below.
         onFocusRequest?()
-        if handleScrollbarMouse(event, isDrag: false) { return }
+        if handleScrollbarMouse(event, isDrag: false) {
+            leftMouseGestureOwner = .scrollbar
+            return
+        }
         // Multi-clicks (2+) always select locally, even when the app tracks the
         // mouse — double-click in vi/tmux should behave like double-click at the
-        // shell (word highlight + Cmd+C), not vanish into the app. Single clicks
-        // still forward, so cursor positioning in those apps keeps working.
+        // shell (word highlight + Cmd+C), not vanish into the app. Shift is the
+        // standard terminal override for local selection while mouse reporting is
+        // active. Unmodified single clicks still forward, so cursor positioning in
+        // those apps keeps working.
         let tracking = mouseTrackingEnabled()
-        if tracking, event.clickCount < 2 {
+        let forceLocal = event.modifierFlags.contains(.shift)
+        if tracking, !forceLocal, event.clickCount < 2 {
             if virtualSelection != nil {
                 virtualSelection = nil
                 needsDisplay = true
             }
+            leftMouseGestureOwner = .application
             mouseButtonDown = true
             send(GHOSTTY_MOUSE_ACTION_PRESS, button: GHOSTTY_MOUSE_BUTTON_LEFT, event: event)
             return
         }
-        trackingLocalGesture = tracking
 
         // Cmd-click opens a URL as a web pane (no selection). Gated to tracking-off
         // (handled above) so it never steals the app's mouse input. We try the
@@ -1500,6 +2046,7 @@ public final class GhosttyTerminalView: NSView {
         }
 
         // Local selection.
+        leftMouseGestureOwner = .local(suppressAutoScroll: tracking)
         let (col, row) = gridCoord(for: event)
         let p = convert(event.locationInWindow, from: nil)
 
@@ -1520,7 +2067,6 @@ public final class GhosttyTerminalView: NSView {
         // Multi-click: word (2) / line (3+) selection in the unified model --
         // identical in live and history rows, and drags keep the granularity.
         if event.clickCount >= 2 {
-            selectionAnchorScreen = nil
             guard let pos = unifiedHit(p) else { return }
             let granularity: SelectionGranularity = event.clickCount >= 3 ? .line : .word
             let range = unifiedRange(at: pos, granularity: granularity)
@@ -1537,7 +2083,6 @@ public final class GhosttyTerminalView: NSView {
 
         // History mode: all selection is virtual (spans history + sink rows).
         if histRowsOnScreen > 0 {
-            selectionAnchorScreen = nil
             if let pos = unifiedHit(p) {
                 virtualSelection = VirtualSelection(anchor: pos, head: pos)
             }
@@ -1548,7 +2093,20 @@ public final class GhosttyTerminalView: NSView {
 
         virtualSelection = nil
         sink.withTerminal { terminal in
-            self.selectionAnchorScreen = self.screenCoord(terminal, col: col, row: row)
+            var point = GhosttyPoint()
+            point.tag = GHOSTTY_POINT_TAG_VIEWPORT
+            point.value.coordinate = GhosttyPointCoordinate(
+                x: UInt16(max(0, col)), y: UInt32(max(0, row)))
+            var ref: GhosttyTrackedGridRef?
+            if ghostty_terminal_grid_ref_track(terminal, point, &ref) == GHOSTTY_SUCCESS {
+                self.selectionAnchorRef = ref
+            }
+        }
+        // Allocation failure must not turn the gesture into a dead drag. The unified
+        // coordinate model is a safe (short-lived) fallback and uses the same path that
+        // successfully handles Shift-click extension.
+        if selectionAnchorRef == nil, let pos = unifiedHit(p) {
+            virtualSelection = VirtualSelection(anchor: pos, head: pos)
         }
         dragMovedSelection = false
     }
@@ -1663,7 +2221,7 @@ public final class GhosttyTerminalView: NSView {
     ) -> (UnifiedPos, UnifiedPos)? {
         var result: (UnifiedPos, UnifiedPos)?
         sink.withTerminal { terminal in
-            guard let ref = self.screenRef(terminal, col: col, row: screenRow) else { return }
+            guard let ref = self.sinkRef(terminal, col: col, screenRow: screenRow) else { return }
             var sel = GhosttySelection()
             sel.size = MemoryLayout<GhosttySelection>.stride
             guard derive(terminal, ref, &sel) == GHOSTTY_SUCCESS else { return }
@@ -1889,9 +2447,17 @@ public final class GhosttyTerminalView: NSView {
     }
 
     public override func mouseDragged(with event: NSEvent) {
-        if handleScrollbarMouse(event, isDrag: true) { return }
-        if mouseTrackingEnabled(), !trackingLocalGesture {
+        let suppressAutoScroll: Bool
+        switch leftMouseGestureOwner {
+        case .scrollbar:
+            _ = handleScrollbarMouse(event, isDrag: true)
+            return
+        case .application:
             send(GHOSTTY_MOUSE_ACTION_MOTION, button: GHOSTTY_MOUSE_BUTTON_LEFT, event: event)
+            return
+        case let .local(suppress):
+            suppressAutoScroll = suppress
+        case .none:
             return
         }
         if virtualSelection != nil {
@@ -1900,10 +2466,10 @@ public final class GhosttyTerminalView: NSView {
             extendVirtualSelection(toPoint: convert(event.locationInWindow, from: nil))
             // A tracking-local gesture stays on the visible (alt) screen:
             // edge-autoscroll would page shell history over the running app.
-            if !trackingLocalGesture { updateAutoScroll(for: event) }
+            if !suppressAutoScroll { updateAutoScroll(for: event) }
             return
         }
-        guard selectionAnchorScreen != nil else { return }
+        guard selectionAnchorRef != nil else { return }
         dragMovedSelection = true
         lastDragEvent = event
         let (col, row) = gridCoord(for: event)
@@ -1914,41 +2480,66 @@ public final class GhosttyTerminalView: NSView {
     public override func mouseUp(with event: NSEvent) {
         stopAutoScroll()
         lastDragEvent = nil
-        if scrollbarDragging {
-            scrollbarDragging = false
+        switch leftMouseGestureOwner {
+        case .scrollbar:
             touchScrollbar()
+            resetInFlightPointerGesture()
             return
-        }
-        if mouseTrackingEnabled(), !trackingLocalGesture {
+        case .application:
             mouseButtonDown = false
             send(GHOSTTY_MOUSE_ACTION_RELEASE, button: GHOSTTY_MOUSE_BUTTON_LEFT, event: event)
+            resetInFlightPointerGesture()
+            return
+        case .local:
+            break
+        case .none:
+            resetInFlightPointerGesture()
             return
         }
-        trackingLocalGesture = false
         // A plain click that never dragged clears any existing selection.
         if virtualSelection != nil, !dragMovedSelection, event.clickCount < 2 {
             virtualSelection = nil
             needsDisplay = true
         }
-        if selectionAnchorScreen != nil, !dragMovedSelection {
+        if selectionAnchorRef != nil, !dragMovedSelection {
             sink.withTerminal { terminal in
                 ghostty_terminal_set(terminal, GHOSTTY_TERMINAL_OPT_SELECTION, nil)
             }
             needsDisplay = true
         }
-        selectionAnchorScreen = nil
-        dragMovedSelection = false
+        resetInFlightPointerGesture()
     }
 
-    /// Set the selection from the stored absolute anchor to the given viewport cell.
-    /// Runs on every drag tick and every auto-scroll tick; both endpoints are resolved in
-    /// ABSOLUTE screen space so the selection stays put as the viewport scrolls.
+    /// Clear only state belonging to an unfinished pointer gesture. Completed native
+    /// and virtual selections deliberately survive this reset so Copy remains stable.
+    private func resetInFlightPointerGesture() {
+        stopAutoScroll()
+        lastDragEvent = nil
+        scrollbarDragging = false
+        mouseButtonDown = false
+        clearSelectionAnchor()
+        dragMovedSelection = false
+        leftMouseGestureOwner = .none
+    }
+
+    private func clearSelectionAnchor() {
+        guard let ref = selectionAnchorRef else { return }
+        selectionAnchorRef = nil
+        // Tracked refs participate in page-list mutation bookkeeping; serialize their
+        // destruction with feed, resize, render, and the tracked-find anchor.
+        sink.withTerminal { _ in ghostty_tracked_grid_ref_free(ref) }
+    }
+
+    /// Set the selection from the tracked anchor to the given viewport cell. The anchor's
+    /// snapshot and the endpoint's fast VIEWPORT ref are obtained under one terminal lock,
+    /// avoiding a reverse lookup through the full scrollback page list.
     private func extendSelection(toViewportCol col: Int, row: Int) {
-        guard let anchor = selectionAnchorScreen else { return }
+        guard let anchor = selectionAnchorRef else { return }
         sink.withTerminal { terminal in
-            guard let end = self.screenCoord(terminal, col: col, row: row),
-                  let startRef = self.screenRef(terminal, col: anchor.col, row: anchor.row),
-                  let endRef = self.screenRef(terminal, col: end.col, row: end.row) else { return }
+            var startRef = GhosttyGridRef()
+            startRef.size = MemoryLayout<GhosttyGridRef>.stride
+            guard ghostty_tracked_grid_ref_snapshot(anchor, &startRef) == GHOSTTY_SUCCESS,
+                  let endRef = self.gridRef(terminal, col: col, row: row) else { return }
             var sel = GhosttySelection()
             sel.size = MemoryLayout<GhosttySelection>.stride
             sel.start = startRef
@@ -1992,7 +2583,7 @@ public final class GhosttyTerminalView: NSView {
     /// mode the unified scroll crosses the history/live seam, so a drag held at the
     /// top edge keeps extending into paged history.
     private func autoScrollTick() {
-        guard let event = lastDragEvent, selectionAnchorScreen != nil || virtualSelection != nil else {
+        guard let event = lastDragEvent, selectionAnchorRef != nil || virtualSelection != nil else {
             stopAutoScroll()
             return
         }
@@ -2033,17 +2624,27 @@ public final class GhosttyTerminalView: NSView {
     }
 
     /// Convert the in-flight NATIVE drag selection into a virtual one so it can
-    /// extend across the seam into history. The stored absolute anchor becomes a
+    /// extend across the seam into history. The tracked anchor becomes a
     /// .sink position; the native selection is cleared (the virtual wash takes
     /// over) and history mode begins.
     private func convertNativeSelectionToVirtual() {
-        guard let anchor = selectionAnchorScreen else { return }
+        guard let anchor = selectionAnchorRef else { return }
+        var anchorPoint: GhosttyPointCoordinate?
         sink.withTerminal { terminal in
+            var point = GhosttyPointCoordinate()
+            if ghostty_tracked_grid_ref_point(
+                anchor, GHOSTTY_POINT_TAG_SCREEN, &point) == GHOSTTY_SUCCESS {
+                anchorPoint = point
+            }
             ghostty_terminal_set(terminal, GHOSTTY_TERMINAL_OPT_SELECTION, nil)
         }
-        let pos = UnifiedPos.sink(screenRow: anchor.row, col: anchor.col)
+        guard let anchorPoint else {
+            clearSelectionAnchor()
+            return
+        }
+        let pos = UnifiedPos.sink(screenRow: Int(anchorPoint.y), col: Int(anchorPoint.x))
         virtualSelection = VirtualSelection(anchor: pos, head: .sink(screenRow: 0, col: 0))
-        selectionAnchorScreen = nil
+        clearSelectionAnchor()
         if historyScrollRows == 0 {
             enterHistory(rows: 1)
         }
@@ -2480,6 +3081,25 @@ public final class GhosttyTerminalView: NSView {
         return result
     }
 
+    /// Every case-insensitive occurrence of `needle` in a row's text, as cell
+    /// column ranges. `offsets` maps each column to its utf16 offset in `line`
+    /// (rowLine / TermHistoryRow semantics). Called from the draw pass on each
+    /// frame so find washes follow their text as the screen scrolls.
+    static func findOccurrenceCols(line: String, offsets: [Int], needle: String) -> [ClosedRange<Int>] {
+        guard !needle.isEmpty, !line.isEmpty else { return [] }
+        var result: [ClosedRange<Int>] = []
+        var from = line.startIndex
+        while let r = line.range(of: needle, options: [.caseInsensitive], range: from..<line.endIndex) {
+            let lo = line.utf16.distance(from: line.utf16.startIndex, to: r.lowerBound.samePosition(in: line.utf16) ?? line.utf16.startIndex)
+            let hi = line.utf16.distance(from: line.utf16.startIndex, to: r.upperBound.samePosition(in: line.utf16) ?? line.utf16.endIndex)
+            if let cols = columnRange(offsets: offsets, utf16Lower: lo, utf16Upper: hi) {
+                result.append(cols)
+            }
+            from = r.upperBound
+        }
+        return result
+    }
+
     /// Map a UTF-16 character range in a row's flattened string back to the inclusive
     /// viewport column range it covers, via the per-column offset table from `rowLine`.
     /// A column is included when its start offset lies within [lower, upper). Pure so it
@@ -2553,6 +3173,12 @@ public final class GhosttyTerminalView: NSView {
     /// item is clicked (or its equivalent is reached). Both forward to the same paths.
     @objc func copy(_ sender: Any?) { _ = copySelection() }
     @objc func paste(_ sender: Any?) { _ = pasteFromPasteboard() }
+
+    /// "Reset Terminal" (block context menu): un-stick VT input modes left behind
+    /// by a crashed program (mouse-report flood at the prompt, hidden cursor, stuck
+    /// alt screen) without clearing the buffer. Reached from the block frame via
+    /// the same selector seam as `copy(_:)`/`paste(_:)`.
+    @objc func resetTerminalState(_ sender: Any?) { sink.resetStuckModes() }
 
     /// Paste pasteboard text to the pty. Honors bracketed-paste mode (DEC 2004):
     /// when the app enabled it, wrap the text in ESC[200~ … ESC[201~ so the shell
@@ -2749,6 +3375,25 @@ public final class GhosttyTerminalView: NSView {
         return ref
     }
 
+    /// Resolve a sink SCREEN position, preferring the equivalent fast VIEWPORT lookup
+    /// whenever it is currently visible. Besides avoiding an O(scrollback) traversal,
+    /// this keeps selection usable if a long-running reflowed page list temporarily
+    /// rejects reverse SCREEN lookups at non-zero columns.
+    private func sinkRef(
+        _ terminal: GhosttyTerminal, col: Int, screenRow: Int
+    ) -> GhosttyGridRef? {
+        var scrollbar = GhosttyTerminalScrollbar()
+        if ghostty_terminal_get(
+            terminal, GHOSTTY_TERMINAL_DATA_SCROLLBAR, &scrollbar) == GHOSTTY_SUCCESS {
+            let viewportRow = screenRow - Int(scrollbar.offset)
+            if viewportRow >= 0, viewportRow < Int(scrollbar.len),
+               let ref = gridRef(terminal, col: col, row: viewportRow) {
+                return ref
+            }
+        }
+        return screenRef(terminal, col: col, row: screenRow)
+    }
+
     /// Whether the terminal currently has an active selection (Copy enablement).
     private func hasSelection() -> Bool {
         if virtualSelection != nil { return true }
@@ -2827,7 +3472,7 @@ public final class GhosttyTerminalView: NSView {
     /// parsed history rows joined with newlines (soft-wrapped rows join without
     /// one, matching live copy's unwrap), then the sink part via the native
     /// selection formatter. Unparsed (evicted/loading) rows are skipped.
-    private func copyVirtualSelection() -> String? {
+    func copyVirtualSelection() -> String? {
         guard let sel = virtualSelection else { return nil }
         let (start, end) = sel.ordered
         var out = ""
@@ -2879,8 +3524,8 @@ public final class GhosttyTerminalView: NSView {
         }
         var sinkText: String?
         sink.withTerminal { terminal in
-            guard let s = self.screenRef(terminal, col: startCol, row: startRow),
-                  let e = self.screenRef(terminal, col: endCol, row: endRow) else { return }
+            guard let s = self.sinkRef(terminal, col: startCol, screenRow: startRow),
+                  let e = self.sinkRef(terminal, col: endCol, screenRow: endRow) else { return }
             var gsel = GhosttySelection()
             gsel.size = MemoryLayout<GhosttySelection>.stride
             gsel.start = s
@@ -2971,6 +3616,7 @@ public final class GhosttyTerminalView: NSView {
     }
     public override func resignFirstResponder() -> Bool {
         hasKeyFocus = false
+        resetInFlightPointerGesture()
         needsDisplay = true // repaint the cursor as a hollow outline
         return true
     }

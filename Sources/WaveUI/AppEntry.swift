@@ -118,11 +118,22 @@ public final class WaveAppDelegate: NSObject, NSApplicationDelegate {
     private func startInstanceServer() {
         guard let dataHome = config.dataHome else { return }
         let server = AppInstanceServer(dataHome: dataHome, version: version) { op in
+            // Query ops answer synchronously on the listener thread (the reply is
+            // written on the same connection); action ops stay fire-and-forget.
+            if op == AppInstanceOp.keyTab {
+                return DispatchQueue.main.sync {
+                    MainActor.assumeIsolated {
+                        AppInstanceOp.tabPrefix
+                            + (retainedAppDelegate?.windowManager?.currentActiveTabId() ?? "")
+                    }
+                }
+            }
             DispatchQueue.main.async {
                 MainActor.assumeIsolated {
                     retainedAppDelegate?.handleInstanceOp(op)
                 }
             }
+            return nil
         }
         instanceServer = server
         server.start()
@@ -173,6 +184,13 @@ public final class WaveAppDelegate: NSObject, NSApplicationDelegate {
             }
             if env["WAVE_NATIVE_SNAPSHOT_QUIT"] == "1" { NSApp.terminate(nil) }
         }
+    }
+
+    /// Arm the activation-click pane focus (see `WaveWindow.appActivationClickPending`):
+    /// when a click re-activates the APP, the clicked window is often key again before
+    /// the click dispatches, so `isKeyWindow` alone can't identify that click.
+    public func applicationDidBecomeActive(_ notification: Notification) {
+        WaveWindow.appActivationClickPending = true
     }
 
     public func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {

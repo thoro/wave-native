@@ -250,14 +250,12 @@ final class QuickOpenOverlayView: NSView, NSTextFieldDelegate {
 }
 
 /// A single quick-open row: optional tinted icon + title, hover/selection highlight.
-final class QuickOpenRowView: NSView {
+final class QuickOpenRowView: HoverRowView {
     var isSelected = false { didSet { refresh() } }
 
     private let action: () -> Void
     private let iconView = NSImageView()
     private let label = NSTextField(labelWithString: "")
-    private var trackingArea: NSTrackingArea?
-    private var isHovered = false { didSet { refresh() } }
 
     init(item: QuickOpenItem, height: CGFloat, action: @escaping () -> Void) {
         self.action = action
@@ -306,6 +304,8 @@ final class QuickOpenRowView: NSView {
 
     override var mouseDownCanMoveWindow: Bool { false }
 
+    override func hoverStateChanged() { refresh() }
+
     private func refresh() {
         let bg: NSColor = isSelected ? Theme.highlightBackground : (isHovered ? Theme.hoverBackground : .clear)
         layer?.backgroundColor = bg.cgColor
@@ -313,17 +313,4 @@ final class QuickOpenRowView: NSView {
     }
 
     override func mouseDown(with event: NSEvent) { action() }
-
-    override func updateTrackingAreas() {
-        super.updateTrackingAreas()
-        if let trackingArea { removeTrackingArea(trackingArea) }
-        let area = NSTrackingArea(rect: bounds,
-                                  options: [.mouseEnteredAndExited, .activeInActiveApp, .inVisibleRect],
-                                  owner: self, userInfo: nil)
-        addTrackingArea(area)
-        trackingArea = area
-    }
-
-    override func mouseEntered(with event: NSEvent) { isHovered = true }
-    override func mouseExited(with event: NSEvent) { isHovered = false }
 }

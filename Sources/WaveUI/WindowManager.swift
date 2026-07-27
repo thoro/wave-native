@@ -157,6 +157,18 @@ public final class WindowManager {
         createAndOpenWorkspace(initialCwd: keyEntry?.coordinator.focusedBlockCwd())
     }
 
+    /// Active tab of the "current" window, for external launchers (KEYTAB op).
+    /// Key window when the app is active; otherwise the frontmost visible window
+    /// (the one that would become key on activation) — external callers invoke
+    /// this from Terminal, where no Wave window is key.
+    public func currentActiveTabId() -> String? {
+        let entry = entries.first(where: { $0.controller.window?.isKeyWindow == true })
+            ?? entries.first(where: { $0.controller.window?.isMainWindow == true })
+            ?? entries.filter { $0.controller.window?.isVisible == true }
+                .min(by: { ($0.controller.window?.orderedIndex ?? .max) < ($1.controller.window?.orderedIndex ?? .max) })
+        return entry?.coordinator.activeTabId
+    }
+
     /// Reopen a window when the app is running with none (closing the last window no longer
     /// quits the app). Binds the first kept backend window so its workspace + durable shells
     /// restore; if none remain it bootstraps a fresh one. No-op while a window is open.

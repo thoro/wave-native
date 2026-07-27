@@ -36,7 +36,7 @@ final class BlockFrameView: NSView {
     // magnify, settings/menu, and close buttons on the right — not a window-level gear).
     private let settingsButton = ChromeIconButton(symbol: "ellipsis", pointSize: 12)
     private let closeButton = ChromeIconButton(symbol: "xmark", pointSize: 11)
-    private let borderOverlay = NSView()
+    private let borderOverlay = PointerTransparentView()
 
     // Web nav chrome (address bar + back/forward/reload), shown only for `view:"web"`
     // blocks. Driven through `env.webNav` (the WaveUI<->WaveWeb bridge) so this module
@@ -130,7 +130,7 @@ final class BlockFrameView: NSView {
         case splitRight, splitDown
         case copy, paste, selectAll
         case themes
-        case forceRestart, termClearBuffer, clearOnRestart, runOnStartup, debugConnection
+        case forceRestart, termClearBuffer, resetTerminal, clearOnRestart, runOnStartup, debugConnection
         case reload, copyURL, openExternal, setBlockHomepage
         case hideNav, unhideNav, userAgentType, zoom
         case copyBlockId, close
@@ -168,7 +168,7 @@ final class BlockFrameView: NSView {
             // live Themes submenu are built here.
             return [.separator, .themes,
                     .separator, .copy, .paste, .selectAll,
-                    .separator, .forceRestart, .termClearBuffer, .clearOnRestart, .runOnStartup, .debugConnection]
+                    .separator, .forceRestart, .termClearBuffer, .resetTerminal, .clearOnRestart, .runOnStartup, .debugConnection]
         case .web:
             // TODO(defer): Open/Close DevTools, Clear History, Clear Cookies and Storage,
             // and the GLOBAL "Set Default Homepage" — these need WKWebsiteDataStore / Web
@@ -793,6 +793,7 @@ final class BlockFrameView: NSView {
             case .themes: menu.addItem(makeThemesItem(meta: meta))
             case .forceRestart: menu.addItem(menuItem("Force Restart Controller", #selector(menuForceRestart)))
             case .termClearBuffer: menu.addItem(menuItem("Clear Buffer", #selector(menuTermClearBuffer)))
+            case .resetTerminal: menu.addItem(menuItem("Reset Terminal", #selector(menuResetTerminal)))
             case .clearOnRestart: menu.addItem(makeClearOnRestartItem(meta: meta))
             case .runOnStartup: menu.addItem(makeRunOnStartupItem(meta: meta))
             case .debugConnection: menu.addItem(makeDebugConnectionItem(meta: meta))
@@ -942,6 +943,7 @@ final class BlockFrameView: NSView {
 
     @objc private func menuForceRestart() { restartController() }
     @objc private func menuTermClearBuffer() { termClearBuffer() }
+    @objc private func menuResetTerminal() { sendToContent(Selector(("resetTerminalState:"))) }
     @objc private func menuClearOnRestartOn() { chromeSetMeta([BlockMeta.clearOnStart: .bool(true)]) }
     @objc private func menuClearOnRestartOff() { chromeSetMeta([BlockMeta.clearOnStart: .bool(false)]) }
     @objc private func menuRunOnStartupOn() { chromeSetMeta([BlockMeta.runOnStart: .bool(true)]) }

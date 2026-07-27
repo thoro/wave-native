@@ -70,7 +70,7 @@ final class AppSingleInstanceTests: XCTestCase {
     // MARK: Control-socket negotiation
 
     func testNegotiateSameVersionRequestsOpenWindow() {
-        let server = AppInstanceServer(dataHome: dataHome, version: "v1") { _ in }
+        let server = AppInstanceServer(dataHome: dataHome, version: "v1") { _ in nil }
         server.start()
         defer { server.stop() }
         waitForSocket()
@@ -79,7 +79,7 @@ final class AppSingleInstanceTests: XCTestCase {
 
     func testNegotiateDifferentVersionRequestsTakeover() {
         let received = OpBox()
-        let server = AppInstanceServer(dataHome: dataHome, version: "v1") { op in received.set(op) }
+        let server = AppInstanceServer(dataHome: dataHome, version: "v1") { op in received.set(op); return nil }
         server.start()
         defer { server.stop() }
         waitForSocket()

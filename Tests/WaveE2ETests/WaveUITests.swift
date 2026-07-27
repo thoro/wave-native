@@ -274,6 +274,19 @@ private func makeWorld() -> (FakeTransport, FakeStore) {
 @MainActor
 final class WaveUITests: XCTestCase {
 
+    func testPointerTransparentOverlayCannotShieldPaneContent() {
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: 200, height: 100))
+        let pane = NSView(frame: container.bounds)
+        let decoration = PointerTransparentView(frame: container.bounds)
+        container.addSubview(pane)
+        container.addSubview(decoration, positioned: .above, relativeTo: pane)
+
+        XCTAssertNil(decoration.hitTest(NSPoint(x: 50, y: 50)))
+        XCTAssertTrue(
+            container.hitTest(NSPoint(x: 50, y: 50)) === pane,
+            "a stale drop/focus overlay must never consume pane mouse gestures")
+    }
+
     // GUARDS §C — SetActiveTab is the controller-start trigger; it must fire on the
     // initial activation and on every user tab switch.
     func testSetActiveTabCalledOnInitAndSwitch() async throws {
@@ -374,6 +387,32 @@ final class WaveUITests: XCTestCase {
             LayoutNode(id: "c", data: TabLayoutData(blockId: "C"), size: 10),
         ], flexDirection: .row)
         XCTAssertNotEqual(sig(tree(10, 10), nil), sig(three, nil))
+    }
+
+    // Self-heal: a mounted BlockFrameView that is not tracked in blockViews is
+    // unreachable by every layout path — it floats frozen above live panes and
+    // swallows their clicks (field bug: per-tab selection/chrome dead zones).
+    // Any rebuild pass, including a non-structural re-publish, must sweep it.
+    func testRebuildSweepsUntrackedBlockFrameView() {
+        let env = BlockEnvFactory(
+            transport: FakeTransport(), store: FakeStore(), tabId: "tab-1", windowId: "w-1")
+        let provider = DefaultBlockViewProvider()
+        let view = LayoutTreeView(env: env, provider: provider)
+        view.frame = CGRect(x: 0, y: 0, width: 600, height: 400)
+        let root = LayoutNode(id: "a", data: TabLayoutData(blockId: "A"), size: 10)
+        view.setLayout(root: root, focusedNodeId: nil, magnifiedNodeId: nil)
+
+        let orphan = BlockFrameView(
+            nodeId: "ghost", env: env.makeEnv(blockRef: .block("GHOST")), provider: provider)
+        orphan.frame = CGRect(x: 0, y: 0, width: 500, height: 300)
+        view.addSubview(orphan)
+        XCTAssertNotNil(orphan.superview)
+
+        view.setLayout(root: root, focusedNodeId: nil, magnifiedNodeId: nil)
+        XCTAssertNil(orphan.superview, "untracked BlockFrameView must be swept by rebuild")
+        XCTAssertNotNil(
+            view.subviews.first { $0 is BlockFrameView },
+            "the tracked pane must survive the sweep")
     }
 
     // GUARDS §L — column split distributes height by weight.
@@ -640,7 +679,7 @@ final class WaveUITests: XCTestCase {
             .splitRight, .splitDown,
             .separator, .themes,
             .separator, .copy, .paste, .selectAll,
-            .separator, .forceRestart, .termClearBuffer, .clearOnRestart, .runOnStartup, .debugConnection,
+            .separator, .forceRestart, .termClearBuffer, .resetTerminal, .clearOnRestart, .runOnStartup, .debugConnection,
             .separator, .copyBlockId, .separator, .close,
         ])
         // The per-pane Themes submenu is now live (term:theme → palette re-render).

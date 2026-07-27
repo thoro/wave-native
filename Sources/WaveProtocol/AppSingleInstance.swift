@@ -39,6 +39,13 @@ public enum AppInstanceOp {
     public static let openWindow = "OPEN"
     /// "Shut down your UI + exit so I (a different version) can take over."
     public static let shutdownForUpgrade = "SHUTDOWN"
+    /// Query: "which tab is active in the current (key/frontmost) window?" The
+    /// primary replies `TAB <tabid>` (empty id when no window is open). Used by
+    /// external launchers (claude-vm) to target the tab the user is looking at —
+    /// the backend cannot know this (window focus never reaches wavesrv).
+    public static let keyTab = "KEYTAB"
+    /// Reply prefix for `keyTab`.
+    public static let tabPrefix = "TAB "
     /// Prefix the primary writes on accept: `VERSION <version>`.
     public static let versionPrefix = "VERSION "
 }
@@ -161,10 +168,12 @@ public enum AppInstanceClient {
 public final class AppInstanceServer: @unchecked Sendable {
     private let path: String
     private let version: String
-    private let onOp: @Sendable (String) -> Void
+    /// Handles one op line; a non-nil return is written back to the client as a
+    /// single reply line before the connection closes (query ops like `KEYTAB`).
+    private let onOp: @Sendable (String) -> String?
     private let listenFD = AtomicFD()
 
-    public init(dataHome: String, version: String, onOp: @escaping @Sendable (String) -> Void) {
+    public init(dataHome: String, version: String, onOp: @escaping @Sendable (String) -> String?) {
         self.path = AppInstanceClient.socketPath(dataHome: dataHome)
         self.version = version
         self.onOp = onOp
@@ -228,7 +237,10 @@ public final class AppInstanceServer: @unchecked Sendable {
         }
         let op = acc.trimmingCharacters(in: .whitespaces)
         guard !op.isEmpty else { return }
-        onOp(op)
+        if let reply = onOp(op) {
+            let out = Array((reply + "\n").utf8)
+            _ = out.withUnsafeBytes { write(cfd, $0.baseAddress, out.count) }
+        }
     }
 }
 

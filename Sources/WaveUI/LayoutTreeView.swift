@@ -386,6 +386,20 @@ final class LayoutTreeView: NSView {
             }
         }
 
+        // Self-heal: a mounted BlockFrameView that is NOT tracked in blockViews is
+        // unreachable by every layout/hide/remove path above -- it stays frozen at its
+        // last frame ABOVE live panes and silently swallows their clicks (seen in the
+        // field as per-tab selection/chrome dead zones parked at a stale 95% magnify
+        // frame). The leak's origin is still unknown, so sweep on every pass and log
+        // the identity to trace it.
+        let tracked = Set(blockViews.values.map(ObjectIdentifier.init))
+        for sub in subviews {
+            guard let stale = sub as? BlockFrameView, !tracked.contains(ObjectIdentifier(stale)) else { continue }
+            NSLog("LAYOUT ORPHAN swept: block=%@ node=%@ frame=%@ tab=%@",
+                  stale.blockRef.oid, stale.nodeId, NSStringFromRect(stale.frame), tabId)
+            stale.removeFromSuperview()
+        }
+
         let hasMagnified = magnifiedNodeId != nil && frames.contains { $0.nodeId == magnifiedNodeId }
         let multiPane = frames.count > 1
         // Animate structural transitions (magnify, split, move) but NOT a geometry pass
@@ -828,7 +842,7 @@ final class LayoutTreeView: NSView {
     }
 
     private func makeDropOverlay() -> NSView {
-        let overlay = NSView()
+        let overlay = PointerTransparentView()
         overlay.wantsLayer = true
         overlay.layer?.backgroundColor = Theme.accent.withAlphaComponent(0.2).cgColor
         overlay.layer?.borderColor = Theme.accent.cgColor
