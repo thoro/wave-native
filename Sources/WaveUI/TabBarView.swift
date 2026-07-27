@@ -26,6 +26,30 @@ private final class TabsContainerView: NSView {
     override var isFlipped: Bool { true }
 }
 
+/// Scroll host for the pills. When the tabs outgrow the space between the workspace
+/// switcher and the chrome buttons, the strip clips and scrolls instead of blowing up
+/// the constraint chain (which used to shove the pills out under the switcher).
+/// Scrollers stay hidden; trackpad swipes scroll natively, and a plain mouse wheel's
+/// vertical delta is remapped to horizontal since the strip only overflows on one axis.
+private final class TabsScrollView: NSScrollView {
+    override var mouseDownCanMoveWindow: Bool { false }
+
+    override func scrollWheel(with event: NSEvent) {
+        guard let doc = documentView,
+              doc.frame.width > contentView.bounds.width,
+              doc.frame.height <= contentView.bounds.height,
+              abs(event.scrollingDeltaY) > abs(event.scrollingDeltaX) else {
+            super.scrollWheel(with: event)
+            return
+        }
+        var origin = contentView.bounds.origin
+        origin.x -= event.scrollingDeltaY
+        origin.x = max(0, min(origin.x, doc.frame.width - contentView.bounds.width))
+        contentView.scroll(to: origin)
+        reflectScrolledClipView(contentView)
+    }
+}
+
 /// View-model row for a tab in the strip.
 public struct TabBarItem: Equatable, Sendable {
     public let tabId: String
@@ -95,6 +119,7 @@ final class TabBarView: NSView {
     private let background = TabStripBackgroundView()
     private let tintLayer = CALayer()
     let workspaceSwitcher = WorkspaceSwitcherView()
+    private let tabsScroll = TabsScrollView()
     private let tabsContainer = TabsContainerView()
     /// Window-drag handle over the genuinely-empty part of the strip. The backdrop is
     /// deliberately non-draggable (see DragViews.swift), so this is what lets the user
@@ -109,6 +134,9 @@ final class TabBarView: NSView {
     private var items: [TabBarItem] = []
     private var activeTabId: String?
     private var pills: [TabPillView] = []
+    /// Set on every pill rebuild; the next layout pass scrolls the active pill into
+    /// view (rebuild-time frames aren't final yet, so it can't scroll immediately).
+    private var pendingScrollToActive = false
     private var tabsWidthConstraint: NSLayoutConstraint?
     /// Sizes the tabs container to its pills' total HEIGHT in the vertical (left) strip,
     /// the mirror of `tabsWidthConstraint` in the horizontal strip. Shrinking the
@@ -177,8 +205,17 @@ final class TabBarView: NSView {
         workspaceSwitcher.onResetWorkspaceLayout = { [weak self] id in self?.onResetWorkspaceLayout?(id) }
         addSubview(workspaceSwitcher)
 
-        tabsContainer.translatesAutoresizingMaskIntoConstraints = false
-        addSubview(tabsContainer)
+        tabsScroll.translatesAutoresizingMaskIntoConstraints = false
+        tabsScroll.drawsBackground = false
+        tabsScroll.hasHorizontalScroller = false
+        tabsScroll.hasVerticalScroller = false
+        tabsScroll.horizontalScrollElasticity = .none
+        tabsScroll.verticalScrollElasticity = .none
+        tabsScroll.automaticallyAdjustsContentInsets = false
+        // The container is the scroll document, positioned by manual frames — keep
+        // autoresizing translation on (the default) so frame-setting sticks.
+        tabsScroll.documentView = tabsContainer
+        addSubview(tabsScroll)
 
         // Above the backdrop (added first) so it hit-tests for the window drag, but it is
         // constrained to empty regions only, so it never sits in front of a pill/button.
@@ -216,9 +253,15 @@ final class TabBarView: NSView {
             settingsButton.heightAnchor.constraint(equalToConstant: 22),
         ])
 
-        let widthC = tabsContainer.widthAnchor.constraint(equalToConstant: 0)
+        // Size-to-content is a PREFERENCE (750): the required chain around the scroll
+        // view (switcher/chrome buttons/drag filler) caps it, so with too many tabs the
+        // strip clips at the available space and scrolls instead of breaking the
+        // switcher's leading constraint and escaping out the left edge.
+        let widthC = tabsScroll.widthAnchor.constraint(equalToConstant: 0)
+        widthC.priority = .defaultHigh
         tabsWidthConstraint = widthC
-        let heightC = tabsContainer.heightAnchor.constraint(equalToConstant: 0)
+        let heightC = tabsScroll.heightAnchor.constraint(equalToConstant: 0)
+        heightC.priority = .defaultHigh
         tabsHeightConstraint = heightC
 
         // Horizontal strip: switcher | tabs | + ......... gear, all centered vertically.
@@ -227,35 +270,37 @@ final class TabBarView: NSView {
             workspaceSwitcher.leadingAnchor.constraint(equalTo: leadingAnchor, constant: Theme.trafficLightInset),
             workspaceSwitcher.centerYAnchor.constraint(equalTo: centerYAnchor, constant: 1.5),
 
-            tabsContainer.leadingAnchor.constraint(equalTo: workspaceSwitcher.trailingAnchor, constant: 8),
-            tabsContainer.topAnchor.constraint(equalTo: topAnchor, constant: 3),
-            tabsContainer.bottomAnchor.constraint(equalTo: bottomAnchor),
+            tabsScroll.leadingAnchor.constraint(equalTo: workspaceSwitcher.trailingAnchor, constant: 8),
+            tabsScroll.topAnchor.constraint(equalTo: topAnchor, constant: 3),
+            tabsScroll.bottomAnchor.constraint(equalTo: bottomAnchor),
             widthC,
 
-            newTabButton.leadingAnchor.constraint(equalTo: tabsContainer.trailingAnchor, constant: 4),
+            newTabButton.leadingAnchor.constraint(equalTo: tabsScroll.trailingAnchor, constant: 4),
             newTabButton.centerYAnchor.constraint(equalTo: centerYAnchor, constant: 1.5),
 
             settingsButton.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -8),
             settingsButton.centerYAnchor.constraint(equalTo: centerYAnchor, constant: 1.5),
 
             // Drag handle: the empty span between the "+" and the gear, full height.
+            // Its non-negative width is the required cap that forces widthC to yield.
             dragFiller.leadingAnchor.constraint(equalTo: newTabButton.trailingAnchor, constant: 4),
             dragFiller.trailingAnchor.constraint(equalTo: settingsButton.leadingAnchor, constant: -4),
+            dragFiller.widthAnchor.constraint(greaterThanOrEqualToConstant: 0),
             dragFiller.topAnchor.constraint(equalTo: topAnchor),
             dragFiller.bottomAnchor.constraint(equalTo: bottomAnchor),
         ]
 
         // Vertical strip: switcher pinned TOP, tabs stacked below, "+" then gear pinned
-        // to the BOTTOM. The tabs container is sized to its pills (heightC); the empty
+        // to the BOTTOM. The tabs scroll host is sized to its pills (heightC); the empty
         // gap below it down to the "+" is the drag handle.
         leftConstraints = [
             workspaceSwitcher.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 8),
             workspaceSwitcher.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -8),
             workspaceSwitcher.topAnchor.constraint(equalTo: topAnchor, constant: 8),
 
-            tabsContainer.leadingAnchor.constraint(equalTo: leadingAnchor),
-            tabsContainer.trailingAnchor.constraint(equalTo: trailingAnchor),
-            tabsContainer.topAnchor.constraint(equalTo: workspaceSwitcher.bottomAnchor, constant: 8),
+            tabsScroll.leadingAnchor.constraint(equalTo: leadingAnchor),
+            tabsScroll.trailingAnchor.constraint(equalTo: trailingAnchor),
+            tabsScroll.topAnchor.constraint(equalTo: workspaceSwitcher.bottomAnchor, constant: 8),
             heightC,
 
             newTabButton.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 8),
@@ -265,9 +310,11 @@ final class TabBarView: NSView {
             settingsButton.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -8),
 
             // Drag handle: the empty span below the last pill down to the "+", full width.
+            // Its non-negative height is the required cap that forces heightC to yield.
             dragFiller.leadingAnchor.constraint(equalTo: leadingAnchor),
             dragFiller.trailingAnchor.constraint(equalTo: trailingAnchor),
-            dragFiller.topAnchor.constraint(equalTo: tabsContainer.bottomAnchor),
+            dragFiller.heightAnchor.constraint(greaterThanOrEqualToConstant: 0),
+            dragFiller.topAnchor.constraint(equalTo: tabsScroll.bottomAnchor),
             dragFiller.bottomAnchor.constraint(equalTo: newTabButton.topAnchor),
         ]
 
@@ -287,6 +334,12 @@ final class TabBarView: NSView {
         super.layout()
         tintLayer.frame = background.bounds
         layoutPills()
+        if pendingScrollToActive {
+            pendingScrollToActive = false
+            if let active = pills.first(where: { $0.isActive }) {
+                tabsContainer.scrollToVisible(active.frame)
+            }
+        }
     }
 
     // MARK: Data
@@ -358,6 +411,7 @@ final class TabBarView: NSView {
             pills.append(pill)
         }
         refreshMoveTargets()
+        pendingScrollToActive = true
         needsLayout = true
         layoutPills()
     }
@@ -367,28 +421,34 @@ final class TabBarView: NSView {
             layoutPillsVertical()
             return
         }
+        let h = tabsScroll.contentSize.height
+        let contentWidth = CGFloat(pills.count) * Theme.tabWidth
+        tabsContainer.frame = CGRect(x: 0, y: 0, width: contentWidth, height: h)
         var x: CGFloat = 0
-        let h = tabsContainer.bounds.height
         for pill in pills {
             pill.frame = CGRect(x: x, y: 0, width: Theme.tabWidth, height: h)
             x += Theme.tabWidth
         }
-        // Size the container to fit its pills so the new-tab button sits flush.
+        // Prefer to fit the pills so the new-tab button sits flush; when they don't
+        // fit, the required chain wins (priority 750) and the strip scrolls.
         tabsWidthConstraint?.constant = x
     }
 
     /// Stack the pills as full-width rows from the top (the container is flipped, so
     /// y grows downward). Each pill is a full-width row of the strip.
     private func layoutPillsVertical() {
-        let w = tabsContainer.bounds.width
+        let w = tabsScroll.contentSize.width
         let rowH = Theme.tabBarLeftRowHeight
+        let contentHeight = CGFloat(pills.count) * rowH
+        tabsContainer.frame = CGRect(x: 0, y: 0, width: w, height: contentHeight)
         var y: CGFloat = 0
         for pill in pills {
             pill.frame = CGRect(x: 0, y: y, width: w, height: rowH)
             y += rowH
         }
-        // Fit the container to its pills so the empty area below is a drag handle, not a
+        // Fit the strip to its pills so the empty area below is a drag handle, not a
         // non-draggable container (the vertical mirror of the horizontal width fit).
+        // Overflow clips and scrolls (priority 750 vs the required chain).
         tabsHeightConstraint?.constant = y
     }
 
