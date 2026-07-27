@@ -69,19 +69,24 @@ cp "$BIN" "$APP/Contents/MacOS/WaveApp"
 # "wavesrv" (no extension).
 cp "$DIR/bin/wavesrv.arm64" "$RES/wavesrv"
 chmod +x "$RES/wavesrv"
-# Durable shells need the wsh "jobmanager" daemon; wavesrv resolves it at
-# $WAVETERM_APP_PATH/bin/wsh-<WaveVersion>-darwin.arm64 (main.swift sets
-# WAVETERM_APP_PATH to this Resources dir for the bundle). Copy whatever versioned
-# arm64 wsh is in bin/, preserving its name so it matches the WaveVersion its bundled
-# wavesrv was built with (dev builds ship 0.0.0; a release ships the tagged version).
-# Skip silently if wsh wasn't built.
-WSH_SRC="$(ls "$DIR"/bin/wsh-*-darwin.arm64 2>/dev/null | head -1 || true)"
-if [ -n "$WSH_SRC" ]; then
+# Durable shells need the wsh "jobmanager" daemon (darwin.arm64), and remote SSH
+# connections need the other-platform wsh binaries wavesrv installs onto the
+# remote host. wavesrv resolves them all at
+# $WAVETERM_APP_PATH/bin/wsh-<WaveVersion>-<os>.<arch> (main.swift sets
+# WAVETERM_APP_PATH to this Resources dir for the bundle). Copy every versioned
+# wsh in bin/, preserving names so they match the WaveVersion the bundled wavesrv
+# was built with (dev builds ship 0.0.0; a release ships the tagged version).
+if ls "$DIR"/bin/wsh-* >/dev/null 2>&1; then
     mkdir -p "$RES/bin"
-    cp "$WSH_SRC" "$RES/bin/$(basename "$WSH_SRC")"
-    chmod +x "$RES/bin/$(basename "$WSH_SRC")"
+    for wsh_src in "$DIR"/bin/wsh-*; do
+        cp "$wsh_src" "$RES/bin/$(basename "$wsh_src")"
+        chmod +x "$RES/bin/$(basename "$wsh_src")"
+    done
+    if ! ls "$DIR"/bin/wsh-*-darwin.arm64 >/dev/null 2>&1; then
+        echo "warning: bin/wsh-*-darwin.arm64 missing — durable local shells will be unavailable (run scripts/build-wsh.sh)" >&2
+    fi
 else
-    echo "warning: bin/wsh-*-darwin.arm64 not found — durable shells will be unavailable (run scripts/build-deps.sh)" >&2
+    echo "warning: bin/wsh-* not found — durable shells and remote wsh will be unavailable (run scripts/build-wsh.sh)" >&2
 fi
 cp "$DIR/Fonts/"*.ttf "$DIR/Fonts/"*.otf "$RES/Fonts/" 2>/dev/null || true
 # App icon (same as Electron Wave — vendored from build/icon.icns into Resources/).

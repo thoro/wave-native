@@ -73,12 +73,12 @@ wavesrv:
 		-tags "osusergo,sqlite_omit_load_extension" \
 		-o wave-native/bin/wavesrv.arm64 cmd/server/main-server.go
 
-# Rebuild the wsh binary that backs durable shells (the "wsh jobmanager" daemon).
-# bundle-app.sh copies it into Resources/bin/; wavesrv resolves it under
-# $WAVETERM_APP_PATH/bin (cwd-relative bin/ in the dev run).
+# Rebuild the wsh binaries: darwin.arm64 backs local durable shells (the "wsh
+# jobmanager" daemon); the other platforms are what wavesrv copies to remote SSH
+# hosts. bundle-app.sh copies them all into Resources/bin/; wavesrv resolves them
+# under $WAVETERM_APP_PATH/bin (cwd-relative bin/ in the dev run).
 wsh:
-	cd $(PARENT) && CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build \
-		-o wave-native/bin/wsh-0.0.0-darwin.arm64 ./cmd/wsh
+	./scripts/build-wsh.sh
 
 clean:
 	rm -rf dist .build

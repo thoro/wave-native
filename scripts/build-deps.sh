@@ -66,12 +66,10 @@ echo "==> building wavesrv (CGO, sqlite) -> $NATIVE_DIR/bin/wavesrv.arm64"
 
 # --- 3b. wsh -----------------------------------------------------------------
 # Durable shells exec a detached "wsh jobmanager" daemon that holds the local PTY
-# so it survives a wavesrv restart. wavesrv resolves the binary at
-# $WAVETERM_APP_PATH/bin/wsh-<WaveVersion>-darwin-arm64 (WaveVersion is "0.0.0" in
-# this build); in the dev run that path is $NATIVE_DIR/bin (cwd-relative).
-echo "==> building wsh (durable-shell job manager) -> $NATIVE_DIR/bin/wsh-0.0.0-darwin.arm64"
-( cd "$REPO_ROOT" && CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 \
-  go build -o "$NATIVE_DIR/bin/wsh-0.0.0-darwin.arm64" ./cmd/wsh )
+# so it survives a wavesrv restart, and wavesrv installs wsh onto remote SSH
+# hosts. build-wsh.sh cross-compiles every supported os/arch into bin/
+# (wavesrv resolves them under $WAVETERM_APP_PATH/bin; cwd-relative in dev runs).
+"$NATIVE_DIR/scripts/build-wsh.sh"
 
 # --- 4. fonts ----------------------------------------------------------------
 FONTS="$NATIVE_DIR/Fonts"
