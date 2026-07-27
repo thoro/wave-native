@@ -424,13 +424,14 @@ public final class WaveWindowController: NSWindowController, AppCoordinatorDeleg
     /// lowercased `charactersIgnoringModifiers`; `shift` is whether Shift is held.
     enum GlobalKeyAction: Equatable {
         case workspaceSwitcher, tabSwitcher, newTab, newWindow, closeBlock, closeTab
-        case splitHorizontal, splitVertical, magnify, refocus, reload
+        case splitHorizontal, splitVertical, magnify, refocus, reload, jobPicker
     }
 
     static func letterAction(lower: String, shift: Bool) -> GlobalKeyAction? {
         switch lower {
         case "o" where shift: return .workspaceSwitcher
         case "k" where !shift: return .tabSwitcher
+        case "j" where shift: return .jobPicker
         case "t" where !shift: return .newTab
         // Cmd-N opens a NEW WINDOW (Electron `handleNewWindow`), not a new block.
         case "n" where !shift: return .newWindow
@@ -460,6 +461,7 @@ public final class WaveWindowController: NSWindowController, AppCoordinatorDeleg
         case .magnify: coordinator.magnifyFocused()
         case .refocus: refocusActiveBlock()
         case .reload: reloadFocusedBlock()
+        case .jobPicker: showJobPicker()
         }
     }
 
@@ -480,6 +482,7 @@ public final class WaveWindowController: NSWindowController, AppCoordinatorDeleg
     /// Cmd-I (Electron `globalRefocus`): move firstResponder back onto the visible
     /// tab's focused pane. The visible layout view is the only un-hidden one.
     private func refocusActiveBlock() {
+        guard overlay == nil else { return }
         layoutViews.values.first(where: { !$0.isHidden })?.focusActiveBlock()
     }
 
@@ -516,6 +519,39 @@ public final class WaveWindowController: NSWindowController, AppCoordinatorDeleg
         presentOverlay(placeholder: "Go to tab…", items: items, initialSelectionId: activeTabId) {
             [weak self] id in self?.coordinator.selectTab(id)
         }
+    }
+
+    /// Sentinel row id for the empty job-picker state; selecting it is a no-op.
+    private static let noJobsItemId = "__no-detached-jobs__"
+
+    /// Cmd-Shift-J: centered overlay of running durable shell sessions that have no
+    /// live pane (their block was closed/lost — e.g. deleted while the backend was
+    /// down). Selecting one reattaches it into a NEW terminal pane in the active tab
+    /// (`AppCoordinator.reattachJob`). Menu: File → Reattach Shell Session…
+    func showJobPicker() {
+        Task { [weak self] in
+            guard let self else { return }
+            let jobs = await self.coordinator.listDetachedShellJobs()
+            var items = jobs.map { job in
+                QuickOpenItem(id: job.oid, title: Self.jobPickerTitle(job))
+            }
+            if items.isEmpty {
+                items = [QuickOpenItem(id: Self.noJobsItemId, title: "No detached shell sessions")]
+            }
+            self.presentOverlay(placeholder: "Reattach shell session…", items: items,
+                                initialSelectionId: items.first?.id) { [weak self] id in
+                guard let self, id != Self.noJobsItemId,
+                      let job = jobs.first(where: { $0.oid == id }) else { return }
+                self.coordinator.reattachJob(job)
+            }
+        }
+    }
+
+    /// "conn — cmd · jobid8" row title for the reattach picker. Pure, unit-testable.
+    static func jobPickerTitle(_ job: JobInfo) -> String {
+        let conn = (job.connection?.isEmpty == false) ? job.connection! : "local"
+        let cmd = (job.cmd?.isEmpty == false) ? job.cmd! : "shell"
+        return "\(conn) — \(cmd) · \(job.oid.prefix(8))"
     }
 
     private func presentOverlay(placeholder: String, items: [QuickOpenItem],
@@ -619,6 +655,8 @@ public final class WaveWindowController: NSWindowController, AppCoordinatorDeleg
     public func coordinatorRequestFocusBlock(_ blockId: String) {
         // Raise the main window first: Navigate from the (separate) Settings
         // window must bring the pane forward; a no-op when already key.
+        // An explicit navigate supersedes any open quick-open overlay.
+        dismissOverlay()
         window?.makeKeyAndOrderFront(nil)
         let visible = layoutViews.values.first(where: { !$0.isHidden })
         dndLog("controller requestFocusBlock block=\(blockId.suffix(4)) visibleTab=\(visible?.tabId.suffix(4) ?? "nil") activeTab=\(activeTabId?.suffix(4) ?? "nil")")
@@ -668,7 +706,13 @@ public final class WaveWindowController: NSWindowController, AppCoordinatorDeleg
         view.setLayout(root: root, focusedNodeId: focusedNodeId, magnifiedNodeId: magnifiedNodeId)
         // Defer to the next runloop turn so the show/hide + tiling settle before
         // we move firstResponder (firstResponder timing is a known gotcha).
-        DispatchQueue.main.async { view.focusActiveBlock() }
+        // Skip while a quick-open overlay is up: layout publishes arrive async and
+        // would silently yank firstResponder from the overlay's search field back
+        // to the pane behind the scrim.
+        DispatchQueue.main.async { [weak self] in
+            guard self?.overlay == nil else { return }
+            view.focusActiveBlock()
+        }
     }
 
 
@@ -789,6 +833,88 @@ public final class WaveWindowController: NSWindowController, AppCoordinatorDeleg
         } else {
             alert.runModal()
         }
+    }
+
+    /// Backend `userinput` prompt (SSH password / key passphrase / keyboard-interactive
+    /// / unknown host key / wsh install consent) as a window sheet. `confirm` prompts
+    /// map to OK/Cancel (+ optional checkbox); `text` prompts get a text field —
+    /// SECURE unless `publictext` (passwords must never echo). Auto-dismisses as
+    /// cancelled at `timeoutms` so an unanswered prompt doesn't strand a sheet after
+    /// the backend has already timed out. AppKit queues concurrent sheets FIFO, which
+    /// also serializes overlapping prompts (e.g. password + host key).
+    public func coordinatorPresentUserInput(_ request: UserInputRequest) async -> UserInputResponse {
+        guard let window else { return .cancelled(for: request) }
+        let alert = NSAlert()
+        alert.messageText = request.title.isEmpty ? "Wave" : request.title
+        alert.informativeText = Self.userInputPlainText(request.querytext, markdown: request.markdown)
+        alert.alertStyle = .informational
+        alert.addButton(withTitle: (request.oklabel?.isEmpty == false) ? request.oklabel! : "OK")
+        alert.addButton(withTitle: (request.cancellabel?.isEmpty == false) ? request.cancellabel! : "Cancel")
+
+        var textField: NSTextField?
+        var checkbox: NSButton?
+        var accessories: [NSView] = []
+        if request.responsetype == "text" {
+            let field: NSTextField = request.publictext
+                ? NSTextField(frame: NSRect(x: 0, y: 0, width: 260, height: 24))
+                : NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 260, height: 24))
+            textField = field
+            accessories.append(field)
+        }
+        if !request.checkboxmsg.isEmpty {
+            let box = NSButton(checkboxWithTitle: request.checkboxmsg, target: nil, action: nil)
+            checkbox = box
+            accessories.append(box)
+        }
+        if !accessories.isEmpty {
+            let stack = NSStackView(views: accessories)
+            stack.orientation = .vertical
+            stack.alignment = .leading
+            stack.frame = NSRect(x: 0, y: 0, width: 260,
+                                 height: CGFloat(accessories.count) * 28)
+            alert.accessoryView = stack
+            if let textField { alert.window.initialFirstResponder = textField }
+        }
+
+        return await withCheckedContinuation { cont in
+            var finished = false
+            alert.beginSheetModal(for: window) { resp in
+                guard !finished else { return }
+                finished = true
+                let accepted = (resp == .alertFirstButtonReturn)
+                if !accepted {
+                    var cancelled = UserInputResponse.cancelled(for: request)
+                    cancelled.checkboxstat = checkbox?.state == .on
+                    cont.resume(returning: cancelled)
+                    return
+                }
+                cont.resume(returning: UserInputResponse(
+                    type: request.responsetype,
+                    requestid: request.requestid,
+                    text: textField?.stringValue,
+                    confirm: request.responsetype == "confirm" ? true : nil,
+                    checkboxstat: checkbox?.state == .on))
+            }
+            if request.timeoutms > 0 {
+                DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(request.timeoutms)) {
+                    [weak window] in
+                    guard !finished else { return }
+                    window?.endSheet(alert.window, returnCode: .cancel)
+                }
+            }
+        }
+    }
+
+    /// Best-effort plain text for a (possibly markdown) prompt body: NSAlert's
+    /// informative text renders no markup, so parse inline markdown to characters,
+    /// preserving line breaks; fall back to the raw text on parse failure.
+    static func userInputPlainText(_ text: String, markdown: Bool) -> String {
+        guard markdown else { return text }
+        guard let attributed = try? AttributedString(
+            markdown: text,
+            options: AttributedString.MarkdownParsingOptions(
+                interpretedSyntax: .inlineOnlyPreservingWhitespace)) else { return text }
+        return String(attributed.characters)
     }
 
     /// Close confirmation while applications are still running in the scope's shells

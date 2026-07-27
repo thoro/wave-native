@@ -65,7 +65,26 @@ public struct FileDataArg: Codable, Sendable, Equatable {
 /// ignored by the synthesized decoder, so the many other Job fields are skipped.
 public struct JobInfo: Codable, Sendable, Equatable {
     public var oid: String
+    /// Conn the job's manager runs under ("local" or an ssh name).
+    public var connection: String? = nil
+    /// "shell" or "task" (`pkg/waveobj/wtype.go` Job.JobKind).
+    public var jobkind: String? = nil
+    public var cmd: String? = nil
+    /// The block this job streams into; empty/nil when detached.
+    public var attachedblockid: String? = nil
+    /// "init" / "running" / "done".
+    public var jobmanagerstatus: String? = nil
     public init(oid: String) { self.oid = oid }
+}
+
+/// `CommandJobControllerAttachJobData` (`pkg/wshrpc/wshrpctypes.go:883`).
+public struct JobAttachData: Codable, Sendable, Equatable {
+    public var jobid: String
+    public var blockid: String
+    public init(jobid: String, blockid: String) {
+        self.jobid = jobid
+        self.blockid = blockid
+    }
 }
 
 /// `WorkspaceListEntry` (`pkg/waveobj/wtype.go:162-167`) — return shape of
@@ -397,12 +416,41 @@ final class ServiceClient: Sendable {
     /// it asked the backend to terminate.
     @discardableResult
     func terminateAllShells() async throws -> Int {
-        let none: JSONValue? = nil
-        let jobs: [JobInfo] = try await transport.call(command: "jobcontrollerlist", data: none)
+        let jobs = try await listJobs()
         for job in jobs {
             try await transport.callVoid(command: "jobcontrollerexitjob", data: job.oid)
         }
         return jobs.count
+    }
+
+    /// `[wsh] JobControllerListCommand` (cmd "jobcontrollerlist"): every durable job
+    /// record (all statuses; filter client-side).
+    func listJobs() async throws -> [JobInfo] {
+        let none: JSONValue? = nil
+        return try await transport.call(command: "jobcontrollerlist", data: none)
+    }
+
+    /// `[wsh] JobControllerAttachJobCommand` (cmd "jobcontrollerattachjob"): bind a
+    /// durable job to `blockId` (block.JobId + job.AttachedBlockId, transactional).
+    /// Fails if the job is still attached to a DIFFERENT block — detach first.
+    func attachJob(jobId: String, blockId: String) async throws {
+        try await transport.callVoid(
+            command: "jobcontrollerattachjob",
+            data: JobAttachData(jobid: jobId, blockid: blockId))
+    }
+
+    /// `[wsh] JobControllerDetachJobCommand` (cmd "jobcontrollerdetachjob"): clear the
+    /// job<->block binding (the job keeps running).
+    func detachJob(jobId: String) async throws {
+        try await transport.callVoid(command: "jobcontrollerdetachjob", data: jobId)
+    }
+
+    /// `[wsh] JobControllerDisconnectJobCommand` (cmd "jobcontrollerdisconnectjob"):
+    /// drop wavesrv's connection to the job's manager WITHOUT stopping the job. The
+    /// next reconnect restarts streaming from the attached block's file offset — for
+    /// a freshly attached (empty) block that replays the manager's recent buffer.
+    func disconnectJob(jobId: String) async throws {
+        try await transport.callVoid(command: "jobcontrollerdisconnectjob", data: jobId)
     }
 
     // MARK: Config
@@ -474,11 +522,19 @@ final class ServiceClient: Sendable {
         return try await transport.call(command: "connlist", data: none)
     }
 
+    /// SSH connect + connserver start + wsh install all run under the connect RPC's
+    /// context (Electron passes the same 60s). The 5s default killed the wsh binary
+    /// copy mid-transfer ("context deadline exceeded"), silently downgrading the
+    /// connection to wsh-disabled.
+    private static let connConnectTimeoutMs: Int64 = 60000
+
     /// `[wsh] ConnConnectCommand` (`wshclient.go:105`, cmd "connconnect"). Explicitly
     /// (re)connects `host` — used by the connect-error "Retry" affordance. Returns no
     /// payload; progress arrives via `connchange`.
     func connConnect(_ request: ConnRequest) async throws {
-        try await transport.callVoid(command: "connconnect", data: request)
+        try await transport.callVoid(
+            command: "connconnect", data: request, route: nil,
+            timeoutMs: Self.connConnectTimeoutMs)
     }
 
     /// `[wsh] ConnEnsureCommand` (`wshclient.go:117`, cmd "connensure"). Ensures the
@@ -486,12 +542,27 @@ final class ServiceClient: Sendable {
     /// backend requires before a remote shell can start. Invoked when a block's
     /// `connection` meta is set to a remote host.
     func connEnsure(_ data: ConnExtData) async throws {
-        try await transport.callVoid(command: "connensure", data: data)
+        try await transport.callVoid(
+            command: "connensure", data: data, route: nil,
+            timeoutMs: Self.connConnectTimeoutMs)
     }
 
     /// `[wsh] ConnDisconnectCommand` (`wshclient.go:111`, cmd "conndisconnect"). The
     /// arg is the bare connection name (positional string, not a struct).
     func connDisconnect(_ connName: String) async throws {
         try await transport.callVoid(command: "conndisconnect", data: connName)
+    }
+
+    // MARK: User input (SSH prompts / consent dialogs)
+
+    /// `userinput.SendUserInputResponse(response)`
+    /// (`pkg/service/userinputservice/userinputservice.go:13`): answer a backend
+    /// `userinput` prompt. Fire-and-forget on the backend side (non-blocking channel
+    /// send keyed by requestid), so a late answer after the backend's timeout is
+    /// silently dropped — never an error worth surfacing to the user.
+    func sendUserInputResponse(_ response: UserInputResponse) async throws {
+        try await call(WebCallType(
+            service: WaveService.userInput, method: "SendUserInputResponse",
+            args: [try JSONValue.encode(response)]))
     }
 }

@@ -340,8 +340,19 @@ public final class TerminalController: @unchecked Sendable {
         // redrawing prompt's carriage-returns cascade into duplicated lines. Subscribe
         // stays FIRST (GUARDS §T), so appends racing the wait are still buffered.
         await awaitFirstRealSize()
-        try await resync(forceRestart: false)
+        // The resync fails while the block's remote connection is down (backend:
+        // "cannot start shellproc: not connected") — a certainty right after an app
+        // restart, since nothing has connected the SSH conn yet. The persisted
+        // scrollback must replay regardless, or the restored pane sits black until
+        // the shell emits fresh bytes. So: backfill unconditionally, rethrow after.
+        var resyncError: Error?
+        do {
+            try await resync(forceRestart: false)
+        } catch {
+            resyncError = error
+        }
         try await tailBackfill()
+        if let resyncError { throw resyncError }
     }
 
     /// Poll until the view reports its real grid size (`resize`) or a grace timeout
@@ -405,6 +416,17 @@ public final class TerminalController: @unchecked Sendable {
         let offset = reconciler.absOffset
         reconciler = TerminalReconciler(startOffset: offset)
         return offset
+    }
+
+    /// After the block's REMOTE connection transitions to connected: re-issue the
+    /// resync (the mount-time one failed while the conn was down, so no shell ever
+    /// started) and catch up bytes appended while the pane wasn't streaming. A
+    /// reattached durable job resumes at the term-file's size — only NEW bytes flow —
+    /// so without this the restored pane stays stale until the shell prints again.
+    public func handleConnectionUp() async throws {
+        try await resync(forceRestart: false)
+        let offset = beginCatchUp()
+        try await backfill(from: offset)
     }
 
     // MARK: - Input (GUARDS §T: std base64)

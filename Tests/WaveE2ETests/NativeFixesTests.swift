@@ -55,6 +55,55 @@ final class NativeFixesTests: XCTestCase {
         XCTAssertNil(WaveWindowController.letterAction(lower: "n", shift: true))
     }
 
+    // MARK: - Job reattach picker (Cmd-Shift-J)
+
+    func testCmdShiftJRoutesToJobPicker() {
+        XCTAssertEqual(WaveWindowController.letterAction(lower: "j", shift: true), .jobPicker)
+        XCTAssertNil(WaveWindowController.letterAction(lower: "j", shift: false),
+                     "plain Cmd-J is unmapped; only Cmd-Shift-J opens the reattach picker")
+    }
+
+    func testJobPickerTitleDerivation() {
+        var job = JobInfo(oid: "2572e851-663f-43e1-804b-c466a15b7665")
+        job.connection = "thoro@web01"
+        job.cmd = "/bin/zsh"
+        XCTAssertEqual(WaveWindowController.jobPickerTitle(job), "thoro@web01 — /bin/zsh · 2572e851")
+        // Missing/empty fields fall back to local/shell rather than empty strings.
+        let bare = JobInfo(oid: "abcdef0123456789")
+        XCTAssertEqual(WaveWindowController.jobPickerTitle(bare), "local — shell · abcdef01")
+    }
+
+    // MARK: - userinput prompts (SSH password / host key / wsh install consent)
+
+    func testUserInputCancelledResponseShape() {
+        var req = UserInputRequest(
+            requestid: "req-1", querytext: "Install wsh?", responsetype: "confirm",
+            title: "Wave", markdown: true, timeoutms: 60000, checkboxmsg: "", publictext: false,
+            oklabel: "Install wsh", cancellabel: "No wsh")
+        // Confirm prompts decline with confirm=false (the backend's expected "no").
+        let confirmCancel = UserInputResponse.cancelled(for: req)
+        XCTAssertEqual(confirmCancel.type, "confirm")
+        XCTAssertEqual(confirmCancel.requestid, "req-1")
+        XCTAssertEqual(confirmCancel.confirm, false)
+        XCTAssertNil(confirmCancel.errormsg)
+        // Text prompts have no "no" — they unblock the backend via errormsg.
+        req.responsetype = "text"
+        let textCancel = UserInputResponse.cancelled(for: req)
+        XCTAssertEqual(textCancel.type, "text")
+        XCTAssertNil(textCancel.confirm)
+        XCTAssertEqual(textCancel.errormsg, "user cancelled")
+    }
+
+    func testUserInputPlainTextStripsMarkdown() {
+        XCTAssertEqual(
+            WaveWindowController.userInputPlainText("connect to **host** `now`", markdown: true),
+            "connect to host now")
+        // Non-markdown bodies pass through untouched (asterisks and all).
+        XCTAssertEqual(
+            WaveWindowController.userInputPlainText("a *literal* star", markdown: false),
+            "a *literal* star")
+    }
+
     // MARK: - First-run bootstrap: a client with no windows creates one
 
     func testFirstRunBootstrapCreatesWindowWhenClientHasNoWindows() async throws {
@@ -897,6 +946,42 @@ final class NativeFixesTests: XCTestCase {
         XCTAssertLessThan(leftFrames[1].minY, leftFrames[2].minY, "left: pills stack down in Y")
         XCTAssertGreaterThan(leftFrames[0].width, Theme.tabWidth,
                              "left: a pill is a full-width row, wider than a horizontal pill")
+    }
+
+    // With more tabs than fit, the strip must clip and scroll rather than blow up the
+    // constraint chain (which used to break the switcher's leading constraint and push
+    // pills out the LEFT edge, behind the workspace button). Pure layout — no HID.
+    func testTabBarOverflowClipsAndScrollsInsteadOfEscapingLeft() {
+        let items = (1...20).map { TabBarItem(tabId: "t\($0)", name: "Tab \($0)") }
+
+        // Host the bar in a superview (as RootContentView does): a detached root view's
+        // own size never enters the constraint engine, so the width cap can't engage.
+        let host = NSView(frame: NSRect(x: 0, y: 0, width: 700, height: Theme.tabBarHeight))
+        let bar = TabBarView()
+        bar.frame = host.bounds
+        host.addSubview(bar)
+        bar.position = "top"
+        bar.setTabs(items, activeTabId: "t1")
+        host.layoutSubtreeIfNeeded()
+
+        let switcherFrame = bar.workspaceSwitcher.frame
+        XCTAssertEqual(switcherFrame.minX, Theme.trafficLightInset,
+                       "overflow must not break the switcher's traffic-light inset")
+
+        guard let scroll = bar.workspaceSwitcher.superview?.subviews
+            .compactMap({ $0 as? NSScrollView }).first else {
+            XCTFail("tab strip must host its pills in a scroll view")
+            return
+        }
+        XCTAssertLessThanOrEqual(scroll.frame.maxX, bar.bounds.maxX,
+                                 "the pill strip must clip inside the bar")
+        XCTAssertGreaterThan(scroll.documentView?.frame.width ?? 0, scroll.contentSize.width,
+                             "overflowing pills must make the strip scrollable")
+
+        // Every pill keeps its full width inside the (scrollable) document.
+        for frame in bar.pillFrames {
+            XCTAssertEqual(frame.width, Theme.tabWidth)
+        }
     }
 
     // MARK: - Tab drag & drop

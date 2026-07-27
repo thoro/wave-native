@@ -84,6 +84,10 @@ public protocol AppCoordinatorDelegate: AnyObject {
     /// lingers after its NSWindow closes (kept for restore), so `WorkspaceListEntry.windowid`
     /// alone would mark a closed workspace as still open.
     func coordinatorOpenWorkspaceIds() -> Set<String>
+    /// Present a backend `userinput` prompt (SSH password / key passphrase /
+    /// keyboard-interactive / unknown host key / wsh install consent) and return the
+    /// user's answer. The coordinator sends the response back over the service API.
+    func coordinatorPresentUserInput(_ request: UserInputRequest) async -> UserInputResponse
 }
 
 /// Default empty bind hook so existing single-window delegates (and tests) need not
@@ -115,6 +119,11 @@ public extension AppCoordinatorDelegate {
     /// Default empty so delegates without a WindowManager (and tests) report nothing
     /// open — every listed workspace then renders as closed.
     func coordinatorOpenWorkspaceIds() -> Set<String> { [] }
+    /// Default decline so delegates without dialog UI (and tests) unblock the backend
+    /// immediately instead of letting the prompt sit until its timeout.
+    func coordinatorPresentUserInput(_ request: UserInputRequest) async -> UserInputResponse {
+        .cancelled(for: request)
+    }
 }
 
 /// Spawn/launch configuration (GUARDS §P).
@@ -210,6 +219,9 @@ public final class AppCoordinator {
     /// Tabs with an unseen bell/notification (badge on the pill). Set when a background
     /// tab rings; cleared when that tab is activated. Drives `TabBarItem.hasUnread`.
     private var unreadTabs: Set<String> = []
+    /// Remote connections already `connensure`d this session, so tab switches don't
+    /// re-ensure (and thereby re-dial) a connection on every activation.
+    private var ensuredConns: Set<String> = []
 
     /// Sink for desktop notifications, wired by the composition root (WindowManager) to
     /// `NotificationManager`. Left nil in tests, so the badge path can be exercised
@@ -400,6 +412,14 @@ public final class AppCoordinator {
             }
             return
         }
+        // userinput: an SSH-connect prompt (password / passphrase / keyboard-interactive
+        // / unknown host key / wsh install consent). Scoped to the OWNING window's bare
+        // oid (or all windows on fallback); every coordinator subscribes allscopes, so
+        // filter here or every window would pop the same dialog.
+        if event.event == WaveEventName.userInput {
+            handleUserInputEvent(event)
+            return
+        }
         guard event.event == WaveEventName.waveObjUpdate, let data = event.data else { return }
         // The payload is either a single WaveObjUpdate or an array of them.
         if let single = try? data.decode(WaveObjUpdate.self) {
@@ -407,12 +427,26 @@ public final class AppCoordinator {
         } else if let many = try? data.decode([WaveObjUpdate].self) {
             store.applyUpdates(many)
         }
-        // blockfile / userinput: blockfile is consumed by each terminal content view
-        // via its own block-scoped subscription (PROTOCOL §4); config is handled above
-        // (re-pull + notify). userinput (password / keyboard-interactive /
-        // known-hosts prompts during connect) is NOT yet routed — it is the planned
-        // follow-up to this connection phase (a UserInputRequest modal). It currently
-        // falls through here and is dropped; flagged in the module report.
+        // blockfile: consumed by each terminal content view via its own block-scoped
+        // subscription (PROTOCOL §4); config is handled above (re-pull + notify).
+    }
+
+    /// Route a backend user-input prompt to the delegate's dialog and send the answer
+    /// back through the `userinput` service. The backend matches purely by requestid
+    /// (channel cap 1), so a late answer after its timeout is dropped harmlessly.
+    private func handleUserInputEvent(_ event: WaveEvent) {
+        guard let windowId, event.hasScope(windowId),
+              let request = try? event.data?.decode(UserInputRequest.self) else { return }
+        Task { [weak self] in
+            guard let self else { return }
+            let response = await self.delegate?.coordinatorPresentUserInput(request)
+                ?? .cancelled(for: request)
+            do {
+                try await self.service.sendUserInputResponse(response)
+            } catch {
+                NSLog("AppCoordinator: sendUserInputResponse failed: \(error)")
+            }
+        }
     }
 
     // MARK: - Store object subscriptions
@@ -532,6 +566,7 @@ public final class AppCoordinator {
         if let layoutRef = tab?.layoutStateORef {
             subscribeLayout(layoutRef)
         }
+        ensureTabConnections(tab)
 
         // A first-run starter tab has NO blocks (the backend seeds the starter layout
         // only after Electron's onboarding modal). Electron gives a fresh/initial tab a
@@ -558,6 +593,35 @@ public final class AppCoordinator {
                 NSLog("AppCoordinator: initial setActiveTab failed (continuing, treating as recoverable): \(error)")
             } else {
                 delegate?.coordinatorDidFail(error)
+            }
+        }
+    }
+
+    /// Auto-(re)connect the remote connections referenced by a tab's blocks. Nothing
+    /// else connects them after an app restart (`seedConnections` only reads status),
+    /// so without this a restored remote pane's controller can never start and its
+    /// durable job is never reattached — the pane sits black on the connect overlay
+    /// until the user clicks Retry. Best-effort: a failed ensure leaves the overlay's
+    /// error state to surface it.
+    private func ensureTabConnections(_ tab: Tab?) {
+        guard let tab, !tab.blockids.isEmpty else { return }
+        Task { [weak self] in
+            guard let self else { return }
+            let refs = tab.blockids.map { ORef.block($0) }
+            _ = try? await self.store.loadMany(refs)
+            var conns: Set<String> = []
+            for ref in refs {
+                guard let conn = self.store.get(ref)?.asBlock?.meta[ConnectionLabel.metaKey]?.stringValue,
+                      !ConnectionLabel.isLocal(conn) else { continue }
+                conns.insert(conn)
+            }
+            for conn in conns where !self.ensuredConns.contains(conn) {
+                self.ensuredConns.insert(conn)
+                do {
+                    try await self.service.connEnsure(ConnExtData(connname: conn, logblockid: nil))
+                } catch {
+                    NSLog("AppCoordinator: connEnsure \(conn) failed: \(error)")
+                }
             }
         }
     }
@@ -590,13 +654,14 @@ public final class AppCoordinator {
         }
     }
 
-    /// The focused pane's shell-reported working directory (OSC 7), if known — resolved
-    /// through the delegate seam (`coordinatorCwdForBlock`) so the chrome never imports
-    /// WaveTerminal. Internal so the WindowManager can inherit it for a new window.
+    /// The focused pane's working directory, if known. Prefer the live OSC 7 value from
+    /// the content provider, then fall back to the persisted `cmd:cwd` block meta. The
+    /// fallback matters after an app update/restart: the block is restored before its
+    /// terminal has necessarily emitted another OSC 7 report. Internal so the
+    /// WindowManager can inherit it for a new window.
     func focusedBlockCwd() -> String? {
-        guard let blockId = currentFocusedBlockId(),
-              let cwd = delegate?.coordinatorCwdForBlock(blockId), !cwd.isEmpty else { return nil }
-        return cwd
+        guard let blockId = currentFocusedBlockId() else { return nil }
+        return knownCwd(forBlockId: blockId)
     }
 
     /// Set `cmd:cwd` on the freshly created tab's block(s) so its default terminal opens in
@@ -723,11 +788,11 @@ public final class AppCoordinator {
         // Inherit the source pane's working directory on a split. The backend honors the
         // `cmd:cwd` block meta when starting the shell (pkg/waveobj/metaconsts.go
         // `MetaKey_CmdCwd` → durableshellcontroller.go → shellexec `ecmd.Dir`), with an
-        // invalid path falling back to $HOME, so an unknown/stale cwd is harmless. The
-        // cwd lives in the content provider (OSC 7 tracking); WaveUI reaches it via the
-        // delegate seam so the chrome never imports WaveTerminal.
+        // invalid path falling back to $HOME, so an unknown/stale cwd is harmless. Prefer
+        // the content provider's live OSC 7 value; after a native-app restart that cache
+        // starts empty, so `knownCwd` falls back to the source block's persisted meta.
         if let inheritFromBlockId,
-           let cwd = delegate?.coordinatorCwdForBlock(inheritFromBlockId), !cwd.isEmpty {
+           let cwd = knownCwd(forBlockId: inheritFromBlockId) {
             meta["cmd:cwd"] = .string(cwd)
         }
         let termDef = BlockDef(meta: meta)
@@ -740,6 +805,64 @@ public final class AppCoordinator {
                     try await self.service.connEnsure(ConnExtData(connname: conn, logblockid: nil))
                 }
                 let newRef = try await self.service.createBlockWsh(data)
+                self.delegate?.coordinatorRequestFocusBlock(newRef.oid)
+            } catch {
+                self.delegate?.coordinatorDidFail(error)
+            }
+        }
+    }
+
+    /// Running durable SHELL jobs with no live pane: unattached, or attached to a
+    /// block that no longer exists (deleted while wavesrv was down, closed window,
+    /// another instance's leftovers). These are the sessions the reattach picker
+    /// (Cmd-Shift-J) offers.
+    public func listDetachedShellJobs() async -> [JobInfo] {
+        guard let jobs = try? await service.listJobs() else { return [] }
+        var result: [JobInfo] = []
+        for job in jobs {
+            guard job.jobmanagerstatus == "running", (job.jobkind ?? "shell") == "shell" else { continue }
+            if let attached = job.attachedblockid, !attached.isEmpty {
+                if (try? await store.load(ORef.block(attached))) != nil { continue }
+            }
+            result.append(job)
+        }
+        return result
+    }
+
+    /// Reattach a running durable job into a NEW terminal pane in the active tab.
+    /// Order matters:
+    ///   1. The block is created WITHOUT a controller, so its mount resync cannot race
+    ///      us by starting a fresh shell before the job is bound.
+    ///   2. A job still pointing at its (dead) old block must be detached first —
+    ///      `attachjob` refuses to steal an attached job.
+    ///   3. `disconnectjob` forces the next reconnect to restart streaming at the NEW
+    ///      block's file offset (0), which replays the manager's recent buffer; a
+    ///      still-connected stream would only deliver future bytes into an empty pane.
+    ///   4. controller=shell + resync makes DurableShellController take the
+    ///      reuse-jobId path (reconnect, not a fresh shell).
+    public func reattachJob(_ job: JobInfo) {
+        guard let activeTabId else { return }
+        var meta: MetaMapType = ["view": .string("term")]
+        let conn = job.connection
+        if let conn, !ConnectionLabel.isLocal(conn) {
+            meta[ConnectionLabel.metaKey] = .string(conn)
+        }
+        let data = CommandCreateBlockData(
+            tabid: activeTabId, blockdef: BlockDef(meta: meta), focused: true,
+            targetblockid: nil, targetaction: nil)
+        Task {
+            do {
+                if let conn = meta[ConnectionLabel.metaKey]?.stringValue {
+                    try await self.service.connEnsure(ConnExtData(connname: conn, logblockid: nil))
+                }
+                let newRef = try await self.service.createBlockWsh(data)
+                if let attached = job.attachedblockid, !attached.isEmpty {
+                    try await self.service.detachJob(jobId: job.oid)
+                }
+                try await self.service.attachJob(jobId: job.oid, blockId: newRef.oid)
+                try await self.service.disconnectJob(jobId: job.oid)
+                try await self.service.setMeta(oref: .block(newRef.oid), meta: ["controller": .string("shell")])
+                try await self.service.controllerResync(tabId: activeTabId, blockId: newRef.oid, forceRestart: false)
                 self.delegate?.coordinatorRequestFocusBlock(newRef.oid)
             } catch {
                 self.delegate?.coordinatorDidFail(error)
@@ -984,6 +1107,18 @@ public final class AppCoordinator {
               let conn = store.get(.block(blockId))?.asBlock?.meta[ConnectionLabel.metaKey]?.stringValue,
               !ConnectionLabel.isLocal(conn) else { return nil }
         return conn
+    }
+
+    /// Resolve a pane cwd across the native-app lifecycle. A mounted terminal's live
+    /// value is freshest; `cmd:cwd` survives a UI process replacement during updates and
+    /// bridges the interval before the restored terminal reports OSC 7 again.
+    private func knownCwd(forBlockId blockId: String) -> String? {
+        if let liveCwd = delegate?.coordinatorCwdForBlock(blockId), !liveCwd.isEmpty {
+            return liveCwd
+        }
+        guard let persistedCwd = store.get(.block(blockId))?.asBlock?.meta["cmd:cwd"]?.stringValue,
+              !persistedCwd.isEmpty else { return nil }
+        return persistedCwd
     }
 
     // MARK: - Workspace operations

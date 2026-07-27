@@ -260,6 +260,76 @@ public struct WaveEvent: Codable, Sendable {
     public func hasScope(_ scope: String) -> Bool { scopes?.contains(scope) ?? false }
 }
 
+/// `UserInputRequest` (`pkg/userinput/userinput.go:30-41`) — a backend prompt during
+/// SSH connect (password / key passphrase / keyboard-interactive / unknown host key /
+/// wsh install consent). Delivered as the `userinput` WPS event, scoped to the bare
+/// window oid that owns the originating block (all windows on fallback).
+public struct UserInputRequest: Codable, Sendable, Equatable {
+    public var requestid: String
+    public var querytext: String
+    /// "text" (free/secret input) or "confirm" (yes/no).
+    public var responsetype: String
+    public var title: String
+    public var markdown: Bool
+    /// Frontend self-dismiss deadline; the backend enforces its own ctx timeout.
+    public var timeoutms: Int
+    /// Non-empty -> show a checkbox with this label (wsh install "for all connections").
+    public var checkboxmsg: String
+    /// true -> visible text input; false -> masked (password-style).
+    public var publictext: Bool
+    public var oklabel: String?
+    public var cancellabel: String?
+
+    public init(requestid: String, querytext: String, responsetype: String, title: String,
+                markdown: Bool, timeoutms: Int, checkboxmsg: String, publictext: Bool,
+                oklabel: String? = nil, cancellabel: String? = nil) {
+        self.requestid = requestid
+        self.querytext = querytext
+        self.responsetype = responsetype
+        self.title = title
+        self.markdown = markdown
+        self.timeoutms = timeoutms
+        self.checkboxmsg = checkboxmsg
+        self.publictext = publictext
+        self.oklabel = oklabel
+        self.cancellabel = cancellabel
+    }
+}
+
+/// `UserInputResponse` (`pkg/userinput/userinput.go:43-50`) — sent back via the
+/// `userinput` service `SendUserInputResponse`, matched by `requestid` (channel cap 1;
+/// late/duplicate responses are silently dropped by the backend).
+public struct UserInputResponse: Codable, Sendable, Equatable {
+    public var type: String
+    public var requestid: String
+    public var text: String?
+    public var confirm: Bool?
+    /// Non-empty -> backend surfaces it as an error (the "user cancelled" path).
+    public var errormsg: String?
+    public var checkboxstat: Bool?
+
+    public init(type: String, requestid: String, text: String? = nil, confirm: Bool? = nil,
+                errormsg: String? = nil, checkboxstat: Bool? = nil) {
+        self.type = type
+        self.requestid = requestid
+        self.text = text
+        self.confirm = confirm
+        self.errormsg = errormsg
+        self.checkboxstat = checkboxstat
+    }
+
+    /// The decline/dismiss answer for `request`: confirm prompts answer "no"
+    /// (`confirm:false`, how the backend expects a decline); text prompts have no
+    /// "no", so they carry an errormsg that unblocks the backend with an error.
+    public static func cancelled(for request: UserInputRequest) -> UserInputResponse {
+        if request.responsetype == "confirm" {
+            return UserInputResponse(type: request.responsetype, requestid: request.requestid, confirm: false)
+        }
+        return UserInputResponse(type: request.responsetype, requestid: request.requestid,
+                                 errormsg: "user cancelled")
+    }
+}
+
 /// `SubscriptionRequest` (`pkg/wps/wpstypes.go:73-77`). GUARDS §B: `scopes` are
 /// oref strings (e.g. `workspace:<oid>`), not bare ids.
 public struct SubscriptionRequest: Codable, Sendable {

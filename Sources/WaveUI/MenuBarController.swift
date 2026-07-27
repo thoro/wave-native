@@ -162,6 +162,9 @@ final class MenuBarController: NSObject {
             // the controller.
             menu.addItem(controllerItem("New Window", #selector(newWindow), key: "n"))
             menu.addItem(.separator())
+            menu.addItem(controllerItem("Reattach Shell Session…", #selector(reattachSession),
+                                        key: "j", mask: [.command, .shift]))
+            menu.addItem(.separator())
             menu.addItem(controllerItem("Close Tab", #selector(closeTab), key: "w", mask: [.command, .shift]))
             // No Cmd-W here: the window-level global handler binds Cmd-W to
             // close-focused-block (Wave semantics), so giving Close Window the same
@@ -232,6 +235,7 @@ final class MenuBarController: NSObject {
     // MARK: - Actions (routed to the key window's controller)
 
     @objc private func newTab() { controller()?.menuNewTab() }
+    @objc private func reattachSession() { controller()?.showJobPicker() }
     @objc private func newWindow() { controller()?.menuNewWindow() }
     @objc private func closeTab() { controller()?.menuCloseActiveTab() }
     @objc private func closeWindow() { controller()?.window?.performClose(nil) }

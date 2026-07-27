@@ -33,6 +33,12 @@ final class ComposedBlockViewProvider: BlockViewProvider {
         let store: ObjectStoreProtocol
         let blockRef: ORef
         var token: SubscriptionToken?
+        /// Connection-store subscription driving the conn-up resync/catch-up nudge.
+        var connToken: SubscriptionToken?
+        /// Last observed connected state of this block's connection, so only the
+        /// disconnected -> connected TRANSITION triggers the nudge (the store
+        /// notifies on every status upsert).
+        var connWasConnected = false
         /// Latest shell-reported cwd (OSC 7). Read by `cwdForBlock` so a split can start
         /// the new pane in the source pane's directory.
         var currentCwd: String?
@@ -40,6 +46,10 @@ final class ComposedBlockViewProvider: BlockViewProvider {
             self.view = view
             self.store = store
             self.blockRef = blockRef
+        }
+        deinit {
+            token?.cancel()
+            connToken?.cancel()
         }
     }
 
@@ -232,8 +242,36 @@ final class ComposedBlockViewProvider: BlockViewProvider {
             previous?()
             Task { try? await controller?.handleReconnect() }
         }
+        // Remote panes: when this block's SSH connection transitions to CONNECTED
+        // (startup auto-ensure, overlay Retry, network recovery), re-resync + catch
+        // up. The mount-time resync fails while the conn is down, and a reattached
+        // durable job streams only NEW bytes — without this nudge the pane would
+        // stay black/stale until the shell prints something.
+        if let connections = env.connections {
+            entry.connWasConnected = Self.blockConnectionConnected(entry: entry, connections: connections) ?? true
+            entry.connToken = connections.subscribe { [weak self, weak controller] in
+                DispatchQueue.main.async {
+                    guard let self, let entry = self.termEntries[termBlockId] else { return }
+                    guard let connected = Self.blockConnectionConnected(entry: entry, connections: connections) else {
+                        return
+                    }
+                    let wasConnected = entry.connWasConnected
+                    entry.connWasConnected = connected
+                    guard connected, !wasConnected else { return }
+                    Task { try? await controller?.handleConnectionUp() }
+                }
+            }
+        }
         Task { try? await controller.mount() }
         return view
+    }
+
+    /// Whether the block's (remote) connection is currently connected, or nil when the
+    /// block runs on the local machine (which has no conn status to watch).
+    private static func blockConnectionConnected(entry: TermEntry, connections: ConnectionStore) -> Bool? {
+        let conn = entry.store.get(entry.blockRef)?.asBlock?.meta[ConnectionLabel.metaKey]?.stringValue
+        guard let conn, !ConnectionLabel.isLocal(conn) else { return nil }
+        return connections.status(for: conn)?.connected ?? false
     }
 
     // MARK: - Live appearance application
