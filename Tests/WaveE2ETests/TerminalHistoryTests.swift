@@ -350,3 +350,81 @@ final class ClampedSelectionColsTests: XCTestCase {
         XCTAssertNil(GhosttyTerminalView.clampedSelectionCols(lo: 5, hi: 5, textWidth: 10))
     }
 }
+
+// MARK: - Chunk residency / eviction-thrash regression
+// A production app looped fetch->parse->install->evict->refetch for days at
+// full CPU: the live working set (viewport chunks + prev-chunk prefetch + seam
+// chunk) exceeded the fixed 4-chunk cap, so every install evicted a chunk the
+// next draw re-requested. The budget now grows when a recently-evicted chunk
+// is re-requested, and the seam chunk is exempt from eviction.
+
+@MainActor
+final class HistoryChunkResidencyTests: XCTestCase {
+    private func makeModel(chunks: Int) -> TerminalHistoryModel {
+        let model = TerminalHistoryModel()
+        let lines = Int64(chunks) * TerminalHistoryModel.linesPerChunk
+        let anchor = TermHistoryAnchor(
+            fileStartIdx: 0, sinkBaseOffset: lines, fileSize: lines,
+            sinkBaseLine: lines, totalLines: lines)
+        model.setAnchor(anchor, cols: 80)
+        return model
+    }
+
+    private func install(_ model: TerminalHistoryModel, _ idx: Int) {
+        model.installChunk(
+            idx, rows: [histRow("chunk\(idx)")], lineStartRows: [0],
+            startLine: Int64(idx) * TerminalHistoryModel.linesPerChunk, startOffset: 0)
+    }
+
+    func testEvictionKeepsBudgetAndDropsLRU() {
+        let model = makeModel(chunks: 10)
+        for i in 0...4 { install(model, i) }
+        XCTAssertFalse(model.isParsed(0), "oldest chunk should be evicted past the budget")
+        for i in 1...4 { XCTAssertTrue(model.isParsed(i)) }
+        XCTAssertEqual(model.residencyBudget, TerminalHistoryModel.maxParsedChunks)
+    }
+
+    func testRerequestAfterEvictionGrowsBudget() {
+        let model = makeModel(chunks: 10)
+        for i in 0...4 { install(model, i) }
+        XCTAssertFalse(model.isParsed(0))
+        model.noteRequestForThrash(0)
+        XCTAssertEqual(model.residencyBudget, TerminalHistoryModel.maxParsedChunks + 1)
+        install(model, 0)
+        for i in 0...4 { XCTAssertTrue(model.isParsed(i), "chunk \(i) must stay resident after budget growth") }
+    }
+
+    func testThrashGrowthRequiresRecentEviction() {
+        let model = makeModel(chunks: 10)
+        model.noteRequestForThrash(3)
+        XCTAssertEqual(model.residencyBudget, TerminalHistoryModel.maxParsedChunks,
+                       "a request with no prior eviction must not grow the budget")
+        for i in 0...4 { install(model, i) }
+        model.noteRequestForThrash(0)
+        model.noteRequestForThrash(0)
+        XCTAssertEqual(model.residencyBudget, TerminalHistoryModel.maxParsedChunks + 1,
+                       "each eviction may grow the budget at most once")
+    }
+
+    func testSeamChunkIsNeverEvicted() {
+        let model = makeModel(chunks: 10)
+        install(model, 0)
+        model.installSeam(
+            coverageEndLine: Int64(10) * TerminalHistoryModel.linesPerChunk,
+            cut: TermSeamCut(chunkIndex: 0, rowInChunk: 0))
+        for i in 1...6 { install(model, i) }
+        XCTAssertTrue(model.isParsed(0), "the seam chunk must be pinned across evictions")
+        XCTAssertFalse(model.isParsed(1), "LRU eviction should hit the oldest non-pinned chunk")
+    }
+
+    func testResetRestoresBudget() {
+        let model = makeModel(chunks: 10)
+        for i in 0...4 { install(model, i) }
+        model.noteRequestForThrash(0)
+        XCTAssertEqual(model.residencyBudget, TerminalHistoryModel.maxParsedChunks + 1)
+        model.setCols(120)
+        XCTAssertEqual(model.residencyBudget, TerminalHistoryModel.maxParsedChunks,
+                       "a reflow reset must restore the baseline budget")
+        XCTAssertFalse(model.isParsed(0))
+    }
+}

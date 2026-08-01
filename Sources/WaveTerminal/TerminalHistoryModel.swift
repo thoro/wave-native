@@ -66,13 +66,38 @@ public struct TermSeamState: Equatable, Sendable {
     public var exact: Bool
 }
 
+/// Lock-protected counter readable off the main actor -- the parse queue's
+/// cancellation probe for in-flight chunk parses of a stale generation.
+final class AtomicGeneration: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = 0
+
+    func increment() {
+        lock.lock()
+        defer { lock.unlock() }
+        value += 1
+    }
+
+    func load() -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return value
+    }
+}
+
 @MainActor
 public final class TerminalHistoryModel {
     public static let linesPerChunk: Int64 = 10_000
     /// Leading logical lines parsed for VT state (SGR/charset) and discarded.
     public static let warmupLines = 200
     /// Parsed chunks kept resident (rows arrays); counts survive eviction.
+    /// This is the BASELINE residency budget -- see `residencyBudget`.
     public static let maxParsedChunks = 4
+    /// Hard ceiling for the adaptive residency budget.
+    public static let maxResidencyBudget = 16
+    /// A chunk re-requested within this window of its eviction counts as
+    /// thrash and grows the residency budget.
+    public static let thrashWindowSecs: TimeInterval = 30
 
     public struct ParsedChunk {
         public var rows: [TermHistoryRow]
@@ -103,6 +128,21 @@ public final class TerminalHistoryModel {
     /// Bumped on reset (anchor/cols change); in-flight parses of an older
     /// generation are dropped.
     private var generation = 0
+    /// Mirrors `generation` for off-main reads; also bumped on deinit so an
+    /// orphaned in-flight parse aborts instead of grinding to completion.
+    private nonisolated let liveGeneration = AtomicGeneration()
+    /// Chunks whose fetch or parse failed this generation. NOT retried until
+    /// the next reset: a permanently-unfetchable range (e.g. the backend
+    /// pruned past the file start) must not drive an endless
+    /// request->fail->redraw->request loop.
+    private var failedChunks: Set<Int> = []
+    /// Adaptive residency cap, `maxParsedChunks`...`maxResidencyBudget`. Grows
+    /// when a recently-evicted chunk is re-requested -- the signature of
+    /// eviction thrash, where the working set (viewport chunks + prev-chunk
+    /// prefetch + seam chunk) exceeds the cap and every install evicts a chunk
+    /// the very next draw fetches+parses again, looping forever at full CPU.
+    private(set) var residencyBudget = TerminalHistoryModel.maxParsedChunks
+    private var evictedAt: [Int: Date] = [:]
 
     /// Rolling rows-per-line wrap factor from parsed chunks (>= 1.0).
     private var parsedLines: Int64 = 0
@@ -119,8 +159,20 @@ public final class TerminalHistoryModel {
 
     public init() {}
 
+    deinit {
+        liveGeneration.increment()
+    }
+
     public func attach(controller: TerminalController) {
         self.controller = controller
+    }
+
+    private func bumpGeneration() {
+        generation += 1
+        liveGeneration.increment()
+        failedChunks.removeAll()
+        evictedAt.removeAll()
+        residencyBudget = Self.maxParsedChunks
     }
 
     // MARK: - Reset / anchor
@@ -134,7 +186,7 @@ public final class TerminalHistoryModel {
         seamCut = nil
         parsedLines = 0
         parsedRows = 0
-        generation += 1
+        bumpGeneration()
         coverageEndLine = anchor?.sinkBaseLine ?? 0
         onRowsChanged?()
     }
@@ -150,7 +202,7 @@ public final class TerminalHistoryModel {
         seamCut = nil
         parsedLines = 0
         parsedRows = 0
-        generation += 1
+        bumpGeneration()
         onRowsChanged?()
     }
 
@@ -344,7 +396,10 @@ public final class TerminalHistoryModel {
     /// (the view adds it to its scroll offset so on-screen content stays put),
     /// or nil when no advance was possible.
     public func advanceSeam(sinkTop: SinkTopSnapshot, currentOffset: Int64) -> Int? {
-        guard let cut = seamCut, let chunk = chunks[cut.chunkIndex] else { return nil }
+        guard let cut = seamCut, var chunk = chunks[cut.chunkIndex] else { return nil }
+        accessTick += 1
+        chunk.lastAccess = accessTick
+        chunks[cut.chunkIndex] = chunk
         guard let state = seamState, state.signature != sinkTop.signature else {
             seamState?.anchoredAtOffset = currentOffset
             return 0
@@ -429,8 +484,10 @@ public final class TerminalHistoryModel {
     // MARK: - Chunk loading
 
     public func requestChunk(_ idx: Int) {
-        guard idx >= 0, idx < chunkCount, chunks[idx] == nil, !loading.contains(idx) else { return }
+        guard idx >= 0, idx < chunkCount, chunks[idx] == nil, !loading.contains(idx),
+              !failedChunks.contains(idx) else { return }
         guard let controller else { return }
+        noteRequestForThrash(idx)
         loading.insert(idx)
         let gen = generation
         let startLine = Int64(idx) * Self.linesPerChunk
@@ -439,13 +496,14 @@ public final class TerminalHistoryModel {
         let numLines = lineCount(ofChunk: idx) + warmup
         let cols = self.cols
         let palette = paletteProvider?()
+        let liveGen = liveGeneration
         Task { [weak self, parser] in
             var result: HistoryChunkParser.ParseResult?
             var startOffset: Int64 = 0
             do {
                 let fetch = try await controller.fetchHistoryLines(startLine: fetchStart, numLines: numLines)
                 startOffset = fetch.startOffset
-                let stale: @Sendable () -> Bool = { false }
+                let stale: @Sendable () -> Bool = { liveGen.load() != gen }
                 result = await withCheckedContinuation { cont in
                     parser.parse(
                         bytes: fetch.data, cols: cols, warmupLines: Int(warmup),
@@ -462,7 +520,13 @@ public final class TerminalHistoryModel {
             await MainActor.run {
                 guard let self else { return }
                 self.loading.remove(idx)
-                guard self.generation == gen, let result else { return }
+                guard self.generation == gen else { return }
+                guard let result else {
+                    // Failed fetch/parse: without this, the next draw's row(at:)
+                    // re-requests the same chunk and the cycle spins forever.
+                    self.failedChunks.insert(idx)
+                    return
+                }
                 self.installChunk(idx, rows: result.rows, lineStartRows: result.lineStartRows, startLine: startLine, startOffset: startOffset)
             }
         }
@@ -485,7 +549,20 @@ public final class TerminalHistoryModel {
         return chunks[idx] != nil
     }
 
-    private func installChunk(_ idx: Int, rows: [TermHistoryRow], lineStartRows: [Int], startLine: Int64, startOffset: Int64) {
+    /// A chunk re-requested soon after its eviction means the live working set
+    /// (viewport chunks + prev-chunk prefetch + seam chunk) exceeds the
+    /// residency budget; grow it (bounded) so the fetch->install->evict->
+    /// refetch cycle terminates instead of looping at full CPU.
+    func noteRequestForThrash(_ idx: Int) {
+        guard let evicted = evictedAt.removeValue(forKey: idx) else { return }
+        guard Date().timeIntervalSince(evicted) < Self.thrashWindowSecs,
+              residencyBudget < Self.maxResidencyBudget else { return }
+        residencyBudget += 1
+        NSLog("history: chunk %d re-requested %.1fs after eviction (thrash) -- residency budget now %d",
+              idx, Date().timeIntervalSince(evicted), residencyBudget)
+    }
+
+    func installChunk(_ idx: Int, rows: [TermHistoryRow], lineStartRows: [Int], startLine: Int64, startOffset: Int64) {
         accessTick += 1
         chunks[idx] = ParsedChunk(
             rows: rows, startLine: startLine, startOffset: startOffset,
@@ -498,13 +575,17 @@ public final class TerminalHistoryModel {
     }
 
     private func evictIfNeeded(keeping: Int) {
-        while chunks.count > Self.maxParsedChunks {
+        while chunks.count > residencyBudget {
+            // The seam chunk is exempt: advanceSeam needs it resident on every
+            // live prune, and evicting it silently degrades the stitched seam.
+            let pinned: Set<Int> = [keeping, seamCut?.chunkIndex ?? -1]
             let victim = chunks
-                .filter { $0.key != keeping }
+                .filter { !pinned.contains($0.key) }
                 .min { $0.value.lastAccess < $1.value.lastAccess }
             guard let victim else { return }
             // exactRowCounts survives eviction so the row space never shifts
             chunks.removeValue(forKey: victim.key)
+            evictedAt[victim.key] = Date()
         }
     }
 
