@@ -37,6 +37,15 @@ public enum TerminalConst {
     /// ~15k-line sink at typical line lengths; the rest of the (potentially
     /// multi-hundred-MB) file is paged in on demand by the history layer.
     public static let tailBackfillBytes: Int64 = 2 * 1024 * 1024
+
+    /// Reconnect catch-up retry budget. A catch-up that fails leaves the fresh
+    /// reconciler UNLOADED, which silently buffers every future append — a
+    /// permanently frozen pane — so the catch-up must retry until it loads.
+    /// Bounded so a dead transport doesn't retry (and retain the controller)
+    /// forever; a later reconnect starts a fresh catch-up anyway.
+    public static let catchUpMaxAttempts = 20
+    public static let catchUpRetryBaseMs: UInt64 = 250
+    public static let catchUpRetryCapMs: UInt64 = 15_000
 }
 
 /// Merges HTTP backfill with buffered/live `blockfile` appends into a single

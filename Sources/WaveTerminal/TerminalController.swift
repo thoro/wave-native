@@ -111,6 +111,9 @@ public final class TerminalController: @unchecked Sendable {
 
     private let lock = NSLock()
     private var reconciler: TerminalReconciler
+    /// Monotonic id of the latest catch-up (or unmount). A catch-up retry loop
+    /// exits when a newer catch-up supersedes it. Guarded by `lock`.
+    private var catchUpGen = 0
     private var currentSize: TermSize
     /// Set once the view reports a real (laid-out) grid size via `resize`. The backfill
     /// MUST replay at the view's real width: a redrawing (\r-only) prompt fed at the wrong
@@ -375,6 +378,9 @@ public final class TerminalController: @unchecked Sendable {
         lock.lock()
         let token = subToken
         subToken = nil
+        // Stop any in-flight catch-up retry loop (it checks the generation after
+        // each backoff sleep) so a closed pane's controller can deallocate.
+        catchUpGen += 1
         lock.unlock()
         token?.cancel()
     }
@@ -400,6 +406,17 @@ public final class TerminalController: @unchecked Sendable {
     /// produced while the socket was down: re-backfill from our last consumed
     /// offset. The reconciler is reset so appends racing this GET are buffered.
     public func handleReconnect() async throws {
+        await catchUp()
+    }
+
+    /// Run one catch-up: swap in a fresh reconciler, then backfill — retrying with
+    /// backoff until the backfill loads. The retry is NOT optional resilience: a
+    /// failed catch-up leaves the fresh reconciler unloaded, which buffers every
+    /// future append invisibly (a permanently frozen pane whose shell keeps
+    /// running). The loop exits when a newer catch-up / unmount supersedes it
+    /// (generation check) or the bounded retry budget runs out — in which case the
+    /// next reconnect starts a fresh catch-up from the same (unconsumed) offset.
+    private func catchUp() async {
         // Capture the catch-up offset AND swap in a fresh (unloaded) reconciler in a
         // SINGLE critical section. The transport re-subscribes `blockfile` and flips
         // `_connected` before this runs, so a live append can race us here: doing the
@@ -407,15 +424,33 @@ public final class TerminalController: @unchecked Sendable {
         // reconciler's buffer (it is `!loaded`) and is reconciled by content-overlap
         // in `applyBackfill` — never delivered against the stale loaded reconciler at
         // the wrong offset (which would dup or mis-anchor the catch-up).
-        let offset = beginCatchUp()
-        try await backfill(from: offset)
+        let (gen, offset) = beginCatchUp()
+        for attempt in 1...TerminalConst.catchUpMaxAttempts {
+            do {
+                try await backfill(from: offset)
+                return
+            } catch {
+                if attempt == TerminalConst.catchUpMaxAttempts { return }
+                let delayMs = min(
+                    TerminalConst.catchUpRetryBaseMs << (attempt - 1),
+                    TerminalConst.catchUpRetryCapMs)
+                try? await Task.sleep(nanoseconds: delayMs * 1_000_000)
+                if Task.isCancelled || isCatchUpSuperseded(gen) { return }
+            }
+        }
     }
 
-    private func beginCatchUp() -> Int64 {
+    private func beginCatchUp() -> (gen: Int, offset: Int64) {
         lock.lock(); defer { lock.unlock() }
+        catchUpGen += 1
         let offset = reconciler.absOffset
         reconciler = TerminalReconciler(startOffset: offset)
-        return offset
+        return (catchUpGen, offset)
+    }
+
+    private func isCatchUpSuperseded(_ gen: Int) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        return gen != catchUpGen || reconciler.loaded
     }
 
     /// After the block's REMOTE connection transitions to connected: re-issue the
@@ -425,8 +460,7 @@ public final class TerminalController: @unchecked Sendable {
     /// so without this the restored pane stays stale until the shell prints again.
     public func handleConnectionUp() async throws {
         try await resync(forceRestart: false)
-        let offset = beginCatchUp()
-        try await backfill(from: offset)
+        await catchUp()
     }
 
     // MARK: - Input (GUARDS §T: std base64)
@@ -512,7 +546,7 @@ public final class TerminalController: @unchecked Sendable {
 
     private func backfill(from offset: Int64) async throws {
         let (data, info) = try await transport.fetchFile(zoneId: zoneId, name: WaveProtocolConst.blockFileTerm, offset: offset)
-        ingestBackfill(data: data, info: info)
+        try ingestBackfill(data: data, info: info)
     }
 
     private func tailBackfill() async throws {
@@ -579,7 +613,7 @@ public final class TerminalController: @unchecked Sendable {
         DispatchQueue.main.async { handler?(nil) }
     }
 
-    private func ingestBackfill(data: Data, info: WaveFile) {
+    private func ingestBackfill(data: Data, info: WaveFile) throws {
         lock.lock(); defer { lock.unlock() }
         // Overlapping catch-up backfills race here: a second WS reconnect (common on
         // sleep/wake flapping) fires another `handleReconnect` whose `beginCatchUp`
@@ -597,10 +631,12 @@ public final class TerminalController: @unchecked Sendable {
                 sink.feedBackfill(out)
             }
         } catch {
-            // A reconcile fault is a correctness bug, not a transient error; in
-            // debug it must be loud. In release we drop the malformed backfill
-            // rather than corrupt the stream.
+            // A reconcile fault (usually a torn read racing a truncate) must be loud
+            // in debug. In release, RETHROW so the catch-up retry re-fetches: the
+            // malformed backfill used to be dropped here, which left the reconciler
+            // unloaded forever — a permanently frozen pane buffering all output.
             assertionFailure("terminal backfill reconcile failed: \(error)")
+            throw error
         }
     }
 

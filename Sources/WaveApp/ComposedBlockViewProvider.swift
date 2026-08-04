@@ -30,6 +30,12 @@ final class ComposedBlockViewProvider: BlockViewProvider {
     /// per-pane `term:theme` on a config reload, and its block-meta subscription token.
     private final class TermEntry {
         weak var view: GhosttyTerminalView?
+        /// The pane's controller (owned by the view), so the per-transport reconnect
+        /// hook can fan out `handleReconnect` to whatever panes are CURRENTLY live.
+        weak var controller: TerminalController?
+        /// Identity of the transport this pane rides on; the reconnect hook of a
+        /// transport only nudges its own panes.
+        let transportId: ObjectIdentifier
         let store: ObjectStoreProtocol
         let blockRef: ORef
         var token: SubscriptionToken?
@@ -42,8 +48,11 @@ final class ComposedBlockViewProvider: BlockViewProvider {
         /// Latest shell-reported cwd (OSC 7). Read by `cwdForBlock` so a split can start
         /// the new pane in the source pane's directory.
         var currentCwd: String?
-        init(view: GhosttyTerminalView, store: ObjectStoreProtocol, blockRef: ORef) {
+        init(view: GhosttyTerminalView, controller: TerminalController, transportId: ObjectIdentifier,
+             store: ObjectStoreProtocol, blockRef: ORef) {
             self.view = view
+            self.controller = controller
+            self.transportId = transportId
             self.store = store
             self.blockRef = blockRef
         }
@@ -55,6 +64,9 @@ final class ComposedBlockViewProvider: BlockViewProvider {
 
     private let fallback = DefaultBlockViewProvider()
     private var termEntries: [String: TermEntry] = [:]
+    /// Transports whose `onReconnect` hook is already installed (weak: a window's
+    /// transport going away drops its membership, so identity can't go stale).
+    private let reconnectHookedTransports = NSHashTable<AnyObject>.weakObjects()
     private let webViews = NSHashTable<WebBlockView>.weakObjects()
 
     // Latest config snapshot (seeded by the coordinator's config-reload notification).
@@ -215,7 +227,9 @@ final class ComposedBlockViewProvider: BlockViewProvider {
 
         // Register + apply the live appearance (font/transparency/theme) up front, then
         // watch this block's meta so a per-pane `term:theme` change re-renders live.
-        let entry = TermEntry(view: view, store: env.store, blockRef: env.blockRef)
+        let entry = TermEntry(
+            view: view, controller: controller, transportId: ObjectIdentifier(env.transport),
+            store: env.store, blockRef: env.blockRef)
         termEntries[env.blockRef.oid] = entry
         applyTerminalAppearance(to: view, blockMeta: env.store.get(env.blockRef)?.asBlock?.meta)
         entry.token = env.store.subscribe(env.blockRef) { [weak self, weak view] obj in
@@ -234,13 +248,23 @@ final class ComposedBlockViewProvider: BlockViewProvider {
                 controller.sendText(cmd + "\n")
             }
         }
-        // Re-run catch-up backfill on every transport reconnect (gap G3). onReconnect
-        // is a single slot shared across the transport, so chain onto any prior hook
-        // (capture-previous) to keep every mounted terminal's handleReconnect running.
-        let previous = env.transport.onReconnect
-        env.transport.onReconnect = { [weak controller] in
-            previous?()
-            Task { try? await controller?.handleReconnect() }
+        // Re-run catch-up backfill on every transport reconnect (gap G3). One hook
+        // per transport, fanning out to the CURRENTLY live entries of that transport.
+        // The old capture-previous closure chain grew by one link per mount and was
+        // never unlinked, so long-lived sessions fired ever more (mostly dead)
+        // catch-ups per reconnect.
+        if !reconnectHookedTransports.contains(env.transport) {
+            reconnectHookedTransports.add(env.transport)
+            let transportId = ObjectIdentifier(env.transport)
+            env.transport.onReconnect = { [weak self] in
+                DispatchQueue.main.async {
+                    guard let self else { return }
+                    for entry in self.termEntries.values where entry.transportId == transportId {
+                        guard let controller = entry.controller else { continue }
+                        Task { try? await controller.handleReconnect() }
+                    }
+                }
+            }
         }
         // Remote panes: when this block's SSH connection transitions to CONNECTED
         // (startup auto-ensure, overlay Retry, network recovery), re-resync + catch
