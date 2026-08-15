@@ -354,6 +354,51 @@ extension WSFraming {
     }
 }
 
+// MARK: - Unix ws line framing
+
+/// The unix ws channel's newline framing must extract lines with amortized O(1)
+/// consumption (a 1MB socket read holds hundreds of messages under heavy
+/// terminal output) while preserving partial lines across appends.
+final class LineFrameBufferTests: XCTestCase {
+    private func d(_ s: String) -> Data { Data(s.utf8) }
+
+    func testManyLinesInOneChunkSkipsEmpties() {
+        var b = LineFrameBuffer()
+        b.append(d("alpha\nbeta\n\ngam"))
+        XCTAssertEqual(b.nextLine(), d("alpha"))
+        XCTAssertEqual(b.nextLine(), d("beta"))
+        XCTAssertNil(b.nextLine())
+        b.append(d("ma\n"))
+        XCTAssertEqual(b.nextLine(), d("gamma"))
+        XCTAssertNil(b.nextLine())
+    }
+
+    func testPartialLineSurvivesCompaction() {
+        var b = LineFrameBuffer()
+        b.append(d("one\ntwo\npart"))
+        XCTAssertEqual(b.nextLine(), d("one"))
+        XCTAssertEqual(b.nextLine(), d("two"))
+        XCTAssertNil(b.nextLine())
+        b.append(d("ial\nnext\n"))
+        XCTAssertEqual(b.nextLine(), d("partial"))
+        XCTAssertEqual(b.nextLine(), d("next"))
+        XCTAssertNil(b.nextLine())
+    }
+
+    func testByteSplitAcrossEveryBoundary() {
+        let payload = d("first\nsecond\n\nthird\n")
+        for split in 0...payload.count {
+            var b = LineFrameBuffer()
+            b.append(payload.prefix(split))
+            var lines: [Data] = []
+            while let l = b.nextLine() { lines.append(l) }
+            b.append(payload.suffix(payload.count - split))
+            while let l = b.nextLine() { lines.append(l) }
+            XCTAssertEqual(lines, [d("first"), d("second"), d("third")], "split=\(split)")
+        }
+    }
+}
+
 // MARK: - Unix HTTP fetcher (retry + encoding)
 
 final class UnixHTTPFetcherTests: XCTestCase {

@@ -663,6 +663,10 @@ public final class WaveWindowController: NSWindowController, AppCoordinatorDeleg
         visible?.focusBlock(blockId)
     }
 
+    public func coordinatorNavigateToWorkspace(_ workspaceId: String, tabId: String, blockId: String?) {
+        windowManager?.revealWorkspaceTabBlock(workspaceId: workspaceId, tabId: tabId, blockId: blockId)
+    }
+
     public func coordinatorDidUpdateLayout(env: BlockEnvFactory, root: LayoutNode?, focusedNodeId: String?, magnifiedNodeId: String?) {
         // Keep ONE layout view per tab alive across tab switches (show the active
         // tab's, hide the rest). Recreating it on every switch would re-mount the

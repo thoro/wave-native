@@ -338,6 +338,42 @@ final class TerminalControllerTests: XCTestCase {
         XCTAssertEqual(ctrl.currentOffset, 10)
     }
 
+    /// An abandoned catch-up (retry budget exhausted with the backend down) used
+    /// to freeze the pane FOREVER: the unloaded reconciler buffered every future
+    /// append invisibly and nothing ever retried. The next live append must
+    /// rearm one fresh catch-up cycle and recover the pane.
+    func testAbandonedCatchUpRearmsOnNextAppend() async throws {
+        let t = MockTransport()
+        let sink = CapturingTerminalSink()
+        t.cannedBackfill = (d("hello"), termFile(size: 5))
+        let ctrl = TerminalController(blockId: blockId, tabId: tabId, transport: t, sink: sink)
+        ctrl.catchUpMaxAttempts = 2
+        ctrl.catchUpRetryBaseMs = 1
+        ctrl.catchUpRetryCapMs = 1
+        ctrl.resize(TermSize.default)
+        try await ctrl.mount()
+        XCTAssertEqual(ctrl.currentOffset, 5)
+
+        // Outage: every backfill attempt fails, the budget exhausts, the
+        // reconciler stays unloaded — the historical permanent-freeze state.
+        t.fetchError = WaveError.transport("backend down")
+        try await ctrl.handleReconnect()
+        XCTAssertEqual(s(sink.received), "hello")
+        XCTAssertEqual(ctrl.currentOffset, 5)
+
+        // Backend recovers; the file now holds "helloWORLD". The append itself
+        // still buffers invisibly, but it must trigger a fresh catch-up whose
+        // backfill [5, 10) reconciles the buffered bytes (no dup, no gap).
+        t.fetchError = nil
+        t.cannedBackfill = (d("WORLD"), termFile(size: 10))
+        t.fireAppend("WORLD")
+        for _ in 0..<500 where ctrl.currentOffset < 10 {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertEqual(ctrl.currentOffset, 10)
+        XCTAssertEqual(s(sink.received), "helloWORLD")
+    }
+
     private var blockId: String { "11111111-1111-1111-1111-111111111111" }
     private var tabId: String { "22222222-2222-2222-2222-222222222222" }
 }
@@ -361,6 +397,8 @@ private final class MockTransport: WaveTransport, @unchecked Sendable {
         opts: FileOpts(maxsize: TerminalConst.termFileMaxSize, circular: true),
         createdts: 0, size: 0, modts: 0))
     var beforeFetchReturn: (() -> Void)?
+    /// When set, every file fetch throws it (simulates a backend outage).
+    var fetchError: WaveError?
 
     private var handler: (@Sendable (WaveEvent) -> Void)?
 
@@ -424,6 +462,7 @@ private final class MockTransport: WaveTransport, @unchecked Sendable {
 
     func fetchFile(zoneId: String, name: String, offset: Int64) async throws -> (data: Data, info: WaveFile) {
         beforeFetchReturn?()
+        if let fetchError { throw fetchError }
         order.append("backfill")
         return cannedBackfill
     }
@@ -432,6 +471,7 @@ private final class MockTransport: WaveTransport, @unchecked Sendable {
     /// with the same startOffset arithmetic the real server uses.
     func fetchFileRange(zoneId: String, name: String, range: FileFetchRange) async throws -> FileFetchResult {
         beforeFetchReturn?()
+        if let fetchError { throw fetchError }
         order.append("backfill")
         let (data, info) = cannedBackfill
         if let tail = range.tail, tail > 0, Int64(data.count) > tail {
@@ -477,6 +517,23 @@ final class TerminalKeyEncodingTests: XCTestCase {
         // Shift+Left -> ESC[1;2D; Ctrl+Left -> ESC[1;5D.
         XCTAssertEqual(GhosttyTerminalView.csiCursor("D", 2), esc + Data("[1;2D".utf8))
         XCTAssertEqual(GhosttyTerminalView.csiCursor("D", 5), esc + Data("[1;5D".utf8))
+    }
+
+    func testAlternateScrollSequence() {
+        let esc = Data([0x1b])
+        XCTAssertEqual(
+            GhosttyTerminalView.alternateScrollSequence(up: true, applicationCursorKeys: false),
+            esc + Data("[A".utf8))
+        XCTAssertEqual(
+            GhosttyTerminalView.alternateScrollSequence(up: false, applicationCursorKeys: false),
+            esc + Data("[B".utf8))
+        // DECCKM set (vi does this) -> SS3 forms.
+        XCTAssertEqual(
+            GhosttyTerminalView.alternateScrollSequence(up: true, applicationCursorKeys: true),
+            esc + Data("OA".utf8))
+        XCTAssertEqual(
+            GhosttyTerminalView.alternateScrollSequence(up: false, applicationCursorKeys: true),
+            esc + Data("OB".utf8))
     }
 
     func testTildeKeyEncoding() {
@@ -1158,6 +1215,14 @@ final class TerminalModeHealTests: XCTestCase {
         return on
     }
 
+    private func activeScreen(_ sink: GhosttySink) -> GhosttyTerminalScreen {
+        var screen = GHOSTTY_TERMINAL_SCREEN_PRIMARY
+        sink.withTerminal { t in
+            _ = ghostty_terminal_get(t, GHOSTTY_TERMINAL_DATA_ACTIVE_SCREEN, &screen)
+        }
+        return screen
+    }
+
     func testPromptStartClearsStuckMouseReporting() {
         let sink = GhosttySink(cols: 40, rows: 5)
         sink.feed(d("\u{1b}[?1003h\u{1b}[?1006h\u{1b}[?1004h"))
@@ -1195,11 +1260,68 @@ final class TerminalModeHealTests: XCTestCase {
         let sink = GhosttySink(cols: 40, rows: 5)
         sink.feed(d("\u{1b}[?1003h\u{1b}[?1049h\u{1b}[?25l"))
         XCTAssertTrue(modeOn(sink, 1049))
+        XCTAssertEqual(activeScreen(sink), GHOSTTY_TERMINAL_SCREEN_ALTERNATE)
 
         sink.resetStuckModes()
         XCTAssertFalse(modeOn(sink, 1003))
         XCTAssertFalse(modeOn(sink, 1049), "manual reset must leave the alt screen")
+        XCTAssertEqual(
+            activeScreen(sink), GHOSTTY_TERMINAL_SCREEN_PRIMARY,
+            "the BUFFER must swap back too — clearing the 1049 flag alone keeps rendering the dead TUI")
         XCTAssertTrue(modeOn(sink, 25), "manual reset must re-show the cursor")
+    }
+
+    func testPromptStartExitsStuckAltScreen() {
+        // A full-screen TUI (vim, or Claude Code's full-screen views) killed
+        // without DECRST 1049 leaves the alt screen active; the wheel then
+        // encodes as arrow keys (alternate scroll) cycling shell history
+        // instead of scrolling the viewport.
+        let sink = GhosttySink(cols: 40, rows: 5)
+        sink.feed(d("\u{1b}[?1049h\u{1b}[?1h\u{1b}[?25ltui"))
+        XCTAssertTrue(modeOn(sink, 1049))
+
+        sink.feed(d("\u{1b}]133;A\u{7}$ "))
+        XCTAssertFalse(modeOn(sink, 1049), "alt screen must be exited at the prompt mark")
+        XCTAssertEqual(activeScreen(sink), GHOSTTY_TERMINAL_SCREEN_PRIMARY)
+        XCTAssertFalse(modeOn(sink, 1), "cursor-keys application mode belonged to the dead TUI")
+        XCTAssertTrue(modeOn(sink, 25), "the dead TUI's hidden cursor must be re-shown")
+    }
+
+    func testWavePromptMarkHealsStuckModes() {
+        // Wave-launched shells emit OSC 16162;A (shellintegration precmd), not
+        // OSC 133;A — the heal must trigger on Wave's own mark too.
+        let sink = GhosttySink(cols: 40, rows: 5)
+        sink.feed(d("\u{1b}[?1002h\u{1b}[?1006h\u{1b}[?1049h"))
+        XCTAssertTrue(modeOn(sink, 1049))
+
+        sink.feed(d("\u{1b}]16162;A\u{7}$ "))
+        XCTAssertFalse(modeOn(sink, 1002))
+        XCTAssertFalse(modeOn(sink, 1049))
+        XCTAssertEqual(activeScreen(sink), GHOSTTY_TERMINAL_SCREEN_PRIMARY)
+    }
+
+    func testAltScreenEnableAfterWaveMarkSurvives() {
+        // Backfill shape: the chunk replays a prompt, then the still-running
+        // TUI's alt-screen enter. The heal applies AT the mark, not after.
+        let sink = GhosttySink(cols: 40, rows: 5)
+        sink.feed(d("\u{1b}]16162;A\u{7}$ vim\r\u{1b}[?1049h"))
+        XCTAssertTrue(modeOn(sink, 1049), "an alt-screen enter AFTER the prompt mark is live app state")
+        XCTAssertEqual(activeScreen(sink), GHOSTTY_TERMINAL_SCREEN_ALTERNATE)
+    }
+
+    func testHealPreservesPrimaryScreenContentAndCursor() {
+        // 1049 exit must restore the saved primary cursor so the prompt renders
+        // right after the command line that launched the TUI.
+        let sink = GhosttySink(cols: 40, rows: 5)
+        sink.feed(d("one\r\ntwo\r\n$ vim\r\n"))
+        sink.feed(d("\u{1b}[?1049h\u{1b}[2JTUI"))
+        sink.feed(d("\u{1b}]16162;A\u{7}"))
+        XCTAssertEqual(activeScreen(sink), GHOSTTY_TERMINAL_SCREEN_PRIMARY)
+        var row: UInt16 = 0
+        sink.withTerminal { t in
+            _ = ghostty_terminal_get(t, GHOSTTY_TERMINAL_DATA_CURSOR_Y, &row)
+        }
+        XCTAssertEqual(Int(row), 3, "cursor must land where the primary screen left off")
     }
 }
 #endif

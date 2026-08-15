@@ -187,6 +187,31 @@ public final class WindowManager {
         entry.coordinator.revealBlock(tabId: tabId, blockId: blockId)
     }
 
+    /// Cross-workspace task-pill navigation: reveal `tabId` (+ optionally `blockId`)
+    /// in whatever window shows `workspaceId`, opening one when none is. The
+    /// open path binds asynchronously, so the reveal is parked and applied on bind.
+    public func revealWorkspaceTabBlock(workspaceId: String, tabId: String, blockId: String?) {
+        if let entry = entries.first(where: { $0.workspaceId == workspaceId }) {
+            focus(entry.controller)
+            reveal(in: entry.coordinator, tabId: tabId, blockId: blockId)
+            return
+        }
+        pendingReveal = (workspaceId, tabId, blockId)
+        focusOrOpen(workspaceId: workspaceId)
+    }
+
+    /// Reveal parked by `revealWorkspaceTabBlock` while its workspace's window was
+    /// still opening; consumed by the matching bind.
+    private var pendingReveal: (workspaceId: String, tabId: String, blockId: String?)?
+
+    private func reveal(in coordinator: AppCoordinator, tabId: String, blockId: String?) {
+        if let blockId {
+            coordinator.revealBlock(tabId: tabId, blockId: blockId)
+        } else {
+            coordinator.selectTab(tabId)
+        }
+    }
+
     /// Workspaces currently shown in a live NSWindow. This is the authoritative "is
     /// open" signal for the switcher: a backend `window:<id>` row lingers after its
     /// NSWindow closes (kept for restore, e.g. closing the last window), so
@@ -237,6 +262,16 @@ public final class WindowManager {
         openingWindowIds.remove(windowId)
         applySavedFrame(to: entry)
         persistOpenWorkspaces()
+
+        if let reveal = pendingReveal, reveal.workspaceId == workspaceId {
+            pendingReveal = nil
+            let coordinator = entry.coordinator
+            // Deferred one turn so the freshly bound window finishes publishing its
+            // initial tab before the reveal switches/focuses.
+            DispatchQueue.main.async { [weak self] in
+                self?.reveal(in: coordinator, tabId: reveal.tabId, blockId: reveal.blockId)
+            }
+        }
 
         // Restore-on-launch: open one NSWindow per other backend window — ONCE, from
         // the primary bind. Doing it on every bind would re-open windows the user has

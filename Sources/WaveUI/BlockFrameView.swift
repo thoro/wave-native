@@ -31,6 +31,16 @@ final class BlockFrameView: NSView {
     private let headerView = NSView()
     private let titleField = NSTextField(labelWithString: "")
     private let iconField = NSImageView()
+    /// Compact `display:name` label for WEB panes (which replace the title with the
+    /// nav chrome); zero-width when the pane has no name.
+    private let webNameField = NSTextField(labelWithString: "")
+    /// The pane's `display:name` meta (nil when unset) — overrides the derived
+    /// title for terminal/generic panes and fills `webNameField` for web panes.
+    private var currentDisplayName: String?
+    /// Inline editor for "Rename Pane" (nil while not renaming).
+    private var renameEditor: NSTextField?
+    private var webNavLeadingDefault: NSLayoutConstraint?
+    private var webNavLeadingAfterName: NSLayoutConstraint?
     private let magnifyButton = MagnifyButton()
     // Per-pane header buttons (Electron parity: each block header carries its own
     // magnify, settings/menu, and close buttons on the right — not a window-level gear).
@@ -133,7 +143,7 @@ final class BlockFrameView: NSView {
         case forceRestart, termClearBuffer, resetTerminal, clearOnRestart, runOnStartup, debugConnection
         case reload, copyURL, openExternal, setBlockHomepage
         case hideNav, unhideNav, userAgentType, zoom
-        case copyBlockId, close
+        case renamePane, copyBlockId, close
     }
 
     /// The ordered menu-item ids for a block, by view type + chrome state. Structure
@@ -152,6 +162,7 @@ final class BlockFrameView: NSView {
         items.append(.splitDown)
         items.append(contentsOf: viewSpecificMenuItems(view: view, isNavHidden: isNavHidden))
         items.append(.separator)
+        items.append(.renamePane)
         items.append(.copyBlockId)
         items.append(.separator)
         items.append(.close)
@@ -257,6 +268,13 @@ final class BlockFrameView: NSView {
         titleField.lineBreakMode = .byTruncatingTail
         titleField.translatesAutoresizingMaskIntoConstraints = false
         headerView.addSubview(titleField)
+
+        webNameField.font = Theme.headerFont
+        webNameField.textColor = Theme.textPrimary.withAlphaComponent(0.7)
+        webNameField.lineBreakMode = .byTruncatingTail
+        webNameField.isHidden = true
+        webNameField.translatesAutoresizingMaskIntoConstraints = false
+        headerView.addSubview(webNameField)
 
         // Clickable connection target over the icon+title region (Electron's
         // ConnectionButton): opens the typeahead picker. Hidden/disabled for
@@ -374,11 +392,23 @@ final class BlockFrameView: NSView {
             // Active even while hidden — only one of {title, nav bar} is visible at a
             // time, and the title uses a non-required trailing relation so neither
             // constraint conflicts with the other.
-            webNavBar.leadingAnchor.constraint(equalTo: iconField.trailingAnchor, constant: Theme.headerGap),
             webNavBar.trailingAnchor.constraint(equalTo: magnifyButton.leadingAnchor, constant: -5),
             webNavBar.topAnchor.constraint(equalTo: headerView.topAnchor, constant: 3),
             webNavBar.bottomAnchor.constraint(equalTo: headerView.bottomAnchor, constant: -3),
+
+            // The compact web-pane name sits between the icon and the nav chrome
+            // (visible only when the pane has a `display:name`).
+            webNameField.leadingAnchor.constraint(equalTo: iconField.trailingAnchor, constant: Theme.headerGap),
+            webNameField.centerYAnchor.constraint(equalTo: headerView.centerYAnchor),
+            webNameField.widthAnchor.constraint(lessThanOrEqualToConstant: 160),
         ])
+        // The nav bar's leading swaps between "right after the icon" (unnamed pane)
+        // and "after the name label" (named pane); applyBlock activates one of them.
+        webNavLeadingDefault = webNavBar.leadingAnchor.constraint(
+            equalTo: iconField.trailingAnchor, constant: Theme.headerGap)
+        webNavLeadingAfterName = webNavBar.leadingAnchor.constraint(
+            equalTo: webNameField.trailingAnchor, constant: Theme.headerGap)
+        webNavLeadingDefault?.isActive = true
     }
 
     private func mountContent(viewType: String?) {
@@ -429,10 +459,21 @@ final class BlockFrameView: NSView {
         let mode = Self.headerMode(forView: viewType)
         isTerminalBlock = (mode == .terminal)
         let isWebBlock = (mode == .web)
+        currentDisplayName = block?.meta[BlockMeta.displayName]?.stringValue.flatMap {
+            $0.isEmpty ? nil : $0
+        }
 
-        // The web nav bar replaces the title for web blocks; show it only then.
+        // The web nav bar replaces the title for web blocks; show it only then. A
+        // named web pane additionally shows its compact `display:name` label
+        // between the icon and the nav chrome.
         webNavBar.isHidden = !isWebBlock
         titleField.isHidden = isWebBlock
+        webNameField.stringValue = isWebBlock ? (currentDisplayName ?? "") : ""
+        webNameField.isHidden = !isWebBlock || currentDisplayName == nil
+        let named = isWebBlock && currentDisplayName != nil
+        webNavLeadingDefault?.isActive = false
+        webNavLeadingAfterName?.isActive = false
+        (named ? webNavLeadingAfterName : webNavLeadingDefault)?.isActive = true
         if isWebBlock {
             webNavBar.urlString = env.webNav.currentURL ?? ""
         }
@@ -440,6 +481,7 @@ final class BlockFrameView: NSView {
         // Terminal blocks title from their CONNECTION (Electron's ConnectionButton):
         // local → the local display name, remote → "user@host". Other view types keep
         // their generic title (controller/title/view) and no connection affordance.
+        // A `display:name` (Rename Pane) overrides the derived title in both cases.
         if isTerminalBlock {
             currentConnName = block?.meta[ConnectionLabel.metaKey]?.stringValue
             connClickTarget.isHidden = (env.onPickConnection == nil)
@@ -448,7 +490,9 @@ final class BlockFrameView: NSView {
             currentConnName = nil
             connClickTarget.isHidden = true
             removeConnOverlay()
-            let title = block?.meta["controller"]?.stringValue
+            let title = currentDisplayName
+                ?? block?.meta["controller"]?.stringValue
+                ?? block?.meta[BlockMeta.frameTitle]?.stringValue
                 ?? block?.meta["title"]?.stringValue
                 ?? viewType
                 ?? "block"
@@ -465,7 +509,9 @@ final class BlockFrameView: NSView {
         guard isTerminalBlock else { return }
         let localName = env.connections?.localDisplayName ?? ConnectionLabel.defaultLocalDisplayName()
         let derived = ConnectionLabel.derive(connection: currentConnName, localDisplayName: localName)
-        titleField.stringValue = derived.title
+        // Rename Pane wins over the connection label; the connection icon + tint keep
+        // showing where the shell runs, and the tooltip preserves the full conn title.
+        titleField.stringValue = currentDisplayName ?? derived.title
         iconField.image = Self.symbol(derived.icon)
 
         let status = currentConnName.flatMap { env.connections?.status(for: $0) }
@@ -531,6 +577,7 @@ final class BlockFrameView: NSView {
         switch view {
         case "term": return symbol("terminal")
         case "web": return symbol("globe")
+        case TasksPaneView.viewType: return symbol("checklist")
         default: return symbol("squareshape")
         }
     }
@@ -746,6 +793,7 @@ final class BlockFrameView: NSView {
     /// imported from WaveWeb/WaveTerminal) so the chrome stays free of the content
     /// modules — every item is just a `setMeta` on `blockRef`, exactly as Electron does.
     private enum BlockMeta {
+        static let frameTitle = "frame:title"
         static let clearOnStart = "cmd:clearonstart"
         static let runOnStart = "cmd:runonstart"
         static let connDebug = "term:conndebug"
@@ -754,6 +802,7 @@ final class BlockFrameView: NSView {
         static let webZoom = "web:zoom"
         static let pinnedURL = "pinnedurl"
         static let termTheme = "term:theme"
+        static let displayName = "display:name"
     }
 
     /// Web zoom presets (Electron `webview.tsx` Set-Zoom submenu). The live web view
@@ -805,6 +854,7 @@ final class BlockFrameView: NSView {
             case .unhideNav: menu.addItem(menuItem("Un-Hide Navigation", #selector(menuToggleHideNav)))
             case .userAgentType: menu.addItem(makeUserAgentItem(meta: meta))
             case .zoom: menu.addItem(makeZoomItem(meta: meta))
+            case .renamePane: menu.addItem(menuItem("Rename Pane", #selector(menuRenamePane)))
             case .copyBlockId: menu.addItem(menuItem("Copy BlockId", #selector(menuCopyBlockId)))
             case .close: menu.addItem(menuItem("Close Block", #selector(menuCloseBlock)))
             }
@@ -927,6 +977,66 @@ final class BlockFrameView: NSView {
     @objc private func menuSplitDown() { env.onSplit?(blockRef.oid, "vertical") }
     @objc private func menuCloseBlock() { env.onClose?(blockRef.oid) }
     @objc private func menuCopyBlockId() { copyToClipboard(blockRef.oid) }
+    @objc private func menuRenamePane() { beginRenamePane() }
+
+    // MARK: Rename Pane (inline editor over the title region)
+
+    /// Overlay an inline editor on the header title, prefilled with the current
+    /// `display:name`. Enter/blur commit (empty clears the override, restoring the
+    /// derived title); Esc cancels. Mirrors the tab pill's inline rename.
+    func beginRenamePane() {
+        guard renameEditor == nil else { return }
+        let editor = RenamePaneField()
+        editor.stringValue = currentDisplayName ?? ""
+        editor.placeholderString = "Pane name"
+        editor.font = Theme.headerFont
+        editor.textColor = Theme.textPrimary
+        editor.wantsLayer = true
+        editor.layer?.cornerRadius = Theme.radiusSmall
+        // NSTextField ignores backgroundColor unless drawsBackground is on; without
+        // it the editor is transparent and the title/connection label bleeds through.
+        editor.drawsBackground = true
+        editor.backgroundColor = NSColor(srgbRed: 0.16, green: 0.16, blue: 0.16, alpha: 1)
+        editor.isBordered = false
+        editor.focusRingType = .none
+        editor.translatesAutoresizingMaskIntoConstraints = false
+        editor.onCommit = { [weak self] name in self?.endRenamePane(commit: true, name: name) }
+        editor.onCancel = { [weak self] in self?.endRenamePane(commit: false, name: nil) }
+        // The editor covers the title region; hide the chrome underneath (title or
+        // web nav bar + name label, and the connection click target) so nothing
+        // shows through and clicks can't open the connection picker mid-rename.
+        titleField.isHidden = true
+        webNavBar.isHidden = true
+        webNameField.isHidden = true
+        connClickTarget.isHidden = true
+        headerView.addSubview(editor)
+        NSLayoutConstraint.activate([
+            editor.leadingAnchor.constraint(equalTo: iconField.trailingAnchor, constant: 4),
+            editor.trailingAnchor.constraint(equalTo: magnifyButton.leadingAnchor, constant: -5),
+            editor.centerYAnchor.constraint(equalTo: headerView.centerYAnchor),
+        ])
+        renameEditor = editor
+        window?.makeFirstResponder(editor)
+        editor.currentEditor()?.selectAll(nil)
+    }
+
+    private func endRenamePane(commit: Bool, name: String?) {
+        guard let editor = renameEditor else { return }
+        renameEditor = nil
+        editor.removeFromSuperview()
+        let isWebBlock = Self.headerMode(forView: currentViewType) == .web
+        titleField.isHidden = isWebBlock
+        webNavBar.isHidden = !isWebBlock
+        webNameField.isHidden = !isWebBlock || currentDisplayName == nil
+        connClickTarget.isHidden = !isTerminalBlock || (env.onPickConnection == nil)
+        if commit {
+            let trimmed = (name ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            chromeSetMeta([BlockMeta.displayName: trimmed.isEmpty ? .null : .string(trimmed)])
+        }
+        // Return keyboard focus to the pane's content (the editor stole first
+        // responder; without this the pane looks focused but eats no keys).
+        onRequestFocus?(nodeId)
+    }
 
     // Terminal: route the standard Edit actions to the content view (GhosttyTerminalView
     // implements copy:/paste:/selectAll:). The chrome never imports WaveTerminal, so it
@@ -1429,5 +1539,47 @@ final class VCenterTextFieldCell: NSTextFieldCell {
     override func select(withFrame rect: NSRect, in controlView: NSView, editor: NSText,
                          delegate: Any?, start: Int, length: Int) {
         super.select(withFrame: centered(rect), in: controlView, editor: editor, delegate: delegate, start: start, length: length)
+    }
+}
+
+/// The "Rename Pane" inline editor: Enter/blur commit, Esc cancels. Commit/cancel
+/// are dedicated closures so the frame can tear the editor down without juggling
+/// delegate state.
+final class RenamePaneField: NSTextField, NSTextFieldDelegate {
+    var onCommit: ((String) -> Void)?
+    var onCancel: (() -> Void)?
+    private var finished = false
+
+    init() {
+        super.init(frame: .zero)
+        delegate = self
+        (cell as? NSTextFieldCell)?.usesSingleLineMode = true
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    func control(_ control: NSControl, textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
+        if commandSelector == #selector(NSResponder.cancelOperation(_:)) {
+            finish { $0.onCancel?() }
+            return true
+        }
+        if commandSelector == #selector(NSResponder.insertNewline(_:)) {
+            finish { $0.onCommit?($0.stringValue) }
+            return true
+        }
+        return false
+    }
+
+    func controlTextDidEndEditing(_ obj: Notification) {
+        finish { $0.onCommit?($0.stringValue) }
+    }
+
+    /// Run exactly one terminal action: Enter fires BOTH insertNewline and (via the
+    /// responder chain teardown) textDidEndEditing, which would double-commit.
+    private func finish(_ action: (RenamePaneField) -> Void) {
+        guard !finished else { return }
+        finished = true
+        action(self)
     }
 }

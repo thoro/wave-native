@@ -645,7 +645,7 @@ final class WaveUITests: XCTestCase {
     func testGenericMenuItems() {
         let items = BlockFrameView.blockMenuItems(
             view: .generic, canMagnify: false, isMagnified: false, isNavHidden: false)
-        XCTAssertEqual(items, [.splitRight, .splitDown, .separator, .copyBlockId, .separator, .close])
+        XCTAssertEqual(items, [.splitRight, .splitDown, .separator, .renamePane, .copyBlockId, .separator, .close])
         // Copy BlockId is present for every view type (the P0 generic-parity addition).
         XCTAssertTrue(items.contains(.copyBlockId))
         // No terminal/web-only items leak into the generic menu.
@@ -680,7 +680,7 @@ final class WaveUITests: XCTestCase {
             .separator, .themes,
             .separator, .copy, .paste, .selectAll,
             .separator, .forceRestart, .termClearBuffer, .resetTerminal, .clearOnRestart, .runOnStartup, .debugConnection,
-            .separator, .copyBlockId, .separator, .close,
+            .separator, .renamePane, .copyBlockId, .separator, .close,
         ])
         // The per-pane Themes submenu is now live (term:theme → palette re-render).
         XCTAssertTrue(items.contains(.themes))
@@ -698,7 +698,7 @@ final class WaveUITests: XCTestCase {
             .splitRight, .splitDown,
             .separator, .reload, .copyURL, .openExternal, .setBlockHomepage,
             .separator, .hideNav, .userAgentType, .zoom,
-            .separator, .copyBlockId, .separator, .close,
+            .separator, .renamePane, .copyBlockId, .separator, .close,
         ])
         // When nav is hidden, the toggle reads "Un-Hide" (unhideNav) instead.
         let hidden = BlockFrameView.blockMenuItems(

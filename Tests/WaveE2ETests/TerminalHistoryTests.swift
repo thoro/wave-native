@@ -296,6 +296,39 @@ final class HistoryChunkParserTests: XCTestCase {
         XCTAssertEqual(result?.rows.count, 3)
         XCTAssertEqual(result?.rows[0].plain.hasPrefix("alpha"), true)
     }
+
+    func testLineStartRowsTrackSoftWrappedRawLines() {
+        // 15 chars at 10 cols soft-wraps to 2 rows; the raw-line table must
+        // still count it as ONE line, starting at row 0.
+        let bytes = Data("0123456789ABCDE\r\nshort\r\n".utf8)
+        let result = HistoryChunkParser.parseSync(
+            bytes: bytes, cols: 10, warmupLines: 0, palette: nil, isCancelled: { false })
+        XCTAssertEqual(result?.rows.count, 3)
+        XCTAssertEqual(result?.lineStartRows, [0, 2])
+    }
+
+    func testLineStartRowsIgnoreHardWrapWithoutNewline() {
+        // NEL (ESC E) starts a new visual row without a \n byte -- the
+        // readline hard-wrap case. The backend counts raw \n only, so line 1
+        // ("ghi") must map to row 2, not row 1.
+        let bytes = Data("abc\u{1b}Edef\r\nghi\r\n".utf8)
+        let result = HistoryChunkParser.parseSync(
+            bytes: bytes, cols: 80, warmupLines: 0, palette: nil, isCancelled: { false })
+        XCTAssertEqual(result?.rows.count, 3)
+        XCTAssertEqual(result?.rows[2].plain.hasPrefix("ghi"), true)
+        XCTAssertEqual(result?.lineStartRows, [0, 2])
+    }
+
+    func testWarmupDropsWholeRawLines() {
+        // The warmup raw line spans TWO visual rows via NEL; dropping it by
+        // raw-line boundary must remove both rows.
+        let bytes = Data("warm\u{1b}Eup\r\ntarget\r\n".utf8)
+        let result = HistoryChunkParser.parseSync(
+            bytes: bytes, cols: 80, warmupLines: 1, palette: nil, isCancelled: { false })
+        XCTAssertEqual(result?.rows.count, 1)
+        XCTAssertEqual(result?.rows.first?.plain.hasPrefix("target"), true)
+        XCTAssertEqual(result?.lineStartRows, [0])
+    }
 }
 
 final class PlainWordRangeTests: XCTestCase {

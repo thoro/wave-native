@@ -98,6 +98,71 @@ public struct WorkspaceListEntry: Codable, Sendable, Equatable {
     }
 }
 
+/// `waveobj.TaskLink` (`pkg/waveobj/wtype.go`) — a tab/pane mention inside a task.
+/// `blockid` empty/nil = tab-only mention; `label` is the display fallback once the
+/// target is deleted (live targets resolve their current name).
+public struct WaveTaskLink: Codable, Sendable, Equatable, Hashable {
+    public var tabid: String?
+    public var blockid: String?
+    public var label: String?
+    public init(tabid: String? = nil, blockid: String? = nil, label: String? = nil) {
+        self.tabid = tabid
+        self.blockid = blockid
+        self.label = label
+    }
+}
+
+/// `waveobj.Task` (`pkg/waveobj/wtype.go`). Named WaveTask to avoid colliding with
+/// Swift concurrency's `Task`.
+public struct WaveTask: Codable, Sendable, Equatable {
+    public var oid: String
+    public var workspaceid: String
+    public var text: String
+    public var done: Bool?
+    public var createdts: Int64?
+    public var donets: Int64?
+    public var links: [WaveTaskLink]?
+    public var isDone: Bool { done ?? false }
+    public init(oid: String, workspaceid: String, text: String,
+                done: Bool? = nil, createdts: Int64? = nil, donets: Int64? = nil,
+                links: [WaveTaskLink]? = nil) {
+        self.oid = oid
+        self.workspaceid = workspaceid
+        self.text = text
+        self.done = done
+        self.createdts = createdts
+        self.donets = donets
+        self.links = links
+    }
+}
+
+/// `wshrpc.CommandTaskListData`.
+struct TaskListArg: Codable, Sendable {
+    var workspaceid: String?
+}
+
+/// `wshrpc.CommandTaskCreateData`.
+struct TaskCreateArg: Codable, Sendable {
+    var workspaceid: String
+    var text: String
+    var links: [WaveTaskLink]?
+}
+
+/// `wshrpc.CommandTaskUpdateData` — nil fields are left unchanged server-side.
+/// A non-nil `workspaceid` moves the task ("" unassigns it).
+struct TaskUpdateArg: Codable, Sendable {
+    var taskid: String
+    var text: String?
+    var done: Bool?
+    var links: [WaveTaskLink]?
+    var workspaceid: String?
+}
+
+/// `wshrpc.CommandTaskDeleteData`.
+struct TaskDeleteArg: Codable, Sendable {
+    var taskid: String
+}
+
 /// `CloseTabRtnType` (`pkg/service/workspaceservice/workspaceservice.go:205-208`).
 /// GUARDS §C: if `closewindow` is set, close the window; else switch to
 /// `newactivetabid`.
@@ -421,6 +486,42 @@ final class ServiceClient: Sendable {
             try await transport.callVoid(command: "jobcontrollerexitjob", data: job.oid)
         }
         return jobs.count
+    }
+
+    // MARK: Tasks
+
+    /// `[wsh] TaskListCommand` (cmd "tasklist"): tasks of one workspace, or ALL
+    /// tasks when `workspaceId` is nil (global mode). Sorted by creation time.
+    func listTasks(workspaceId: String?) async throws -> [WaveTask] {
+        return try await transport.call(command: "tasklist", data: TaskListArg(workspaceid: workspaceId))
+    }
+
+    /// `[wsh] TaskCreateCommand` (cmd "taskcreate"). An empty `workspaceId`
+    /// creates an unassigned (global) task. The backend publishes `task:update`
+    /// scoped to the workspace (unscoped when unassigned), so open task panes
+    /// refetch live — no inline updates to apply here.
+    @discardableResult
+    func createTask(workspaceId: String, text: String, links: [WaveTaskLink]) async throws -> WaveTask {
+        return try await transport.call(
+            command: "taskcreate",
+            data: TaskCreateArg(workspaceid: workspaceId, text: text, links: links.isEmpty ? nil : links))
+    }
+
+    /// `[wsh] TaskUpdateCommand` (cmd "taskupdate"). nil fields stay unchanged;
+    /// `done` transitions set/clear the completion timestamp server-side.
+    /// A non-nil `workspaceId` moves the task ("" unassigns it).
+    @discardableResult
+    func updateTask(taskId: String, text: String? = nil, done: Bool? = nil,
+                    links: [WaveTaskLink]? = nil, workspaceId: String? = nil) async throws -> WaveTask {
+        return try await transport.call(
+            command: "taskupdate",
+            data: TaskUpdateArg(taskid: taskId, text: text, done: done, links: links, workspaceid: workspaceId))
+    }
+
+    /// `[wsh] TaskDeleteCommand` (cmd "taskdelete"). Deleting an already-deleted
+    /// task is not an error (idempotent server-side).
+    func deleteTask(taskId: String) async throws {
+        try await transport.callVoid(command: "taskdelete", data: TaskDeleteArg(taskid: taskId))
     }
 
     /// `[wsh] JobControllerListCommand` (cmd "jobcontrollerlist"): every durable job

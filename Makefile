@@ -6,7 +6,8 @@
 #
 #   make app          debug build, bundle into dist/WaveNative.app, run it
 #   make dev          debug build, run FOREGROUND in the isolated test home (logs → terminal)
-#   make bundle       release build + bundle (ad-hoc signed, local only)
+#   make bundle       release build + bundle (ad-hoc signed, local only); rebuilds
+#                     bin/wavesrv.arm64 first when ../ is the wavesrv Go repo
 #   make release      bundle + Developer ID sign + notarize + staple (ship build)
 #   make sign         bundle + Developer ID sign only (no notarize)
 #   make wavesrv      rebuild the bundled Go server (bin/wavesrv.arm64)
@@ -19,6 +20,15 @@
 
 SWIFT_FLAGS := -Xcc -Ivendor/libghostty/include -Xlinker -Lvendor/libghostty/lib
 PARENT := $(abspath ..)
+WAVESRV_MAIN := $(PARENT)/cmd/server/main-server.go
+
+# Release-flow bundles rebuild the bundled Go server first — bundle-app.sh copies
+# bin/wavesrv.arm64 in as Resources/wavesrv, so a stale binary ships silently
+# otherwise. Only when this checkout actually lives inside the wavesrv repo; a
+# standalone wave-native checkout keeps the prebuilt bin.
+ifneq (,$(wildcard $(WAVESRV_MAIN)))
+BUNDLE_DEPS := wavesrv
+endif
 
 # Identity + isolated settings home for the side-by-side test build. It writes to
 # ~/Library/Application Support/waveterm-native-test (baked into LSEnvironment), so it
@@ -49,14 +59,14 @@ dev:
 	WAVETERM_DATA_HOME="$(TEST_DATA_HOME)" WAVETERM_CONFIG_HOME="$(TEST_DATA_HOME)/config" \
 		"dist/$(TEST_APP_NAME).app/Contents/MacOS/WaveApp"
 
-bundle:
+bundle: $(BUNDLE_DEPS)
 	./scripts/bundle-app.sh release
 
 testapp:
 	$(TEST_ENV) ./scripts/bundle-app.sh debug
 	open "dist/$(TEST_APP_NAME).app"
 
-testbundle:
+testbundle: $(BUNDLE_DEPS)
 	$(TEST_ENV) ./scripts/bundle-app.sh release
 
 # Ship build: bundle first (release), THEN Developer ID sign + notarize + staple.

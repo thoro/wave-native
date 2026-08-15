@@ -48,6 +48,10 @@ public protocol AppCoordinatorDelegate: AnyObject {
     /// the new pane is identified by block id, since the backend's `focusednodeid`
     /// after a split does not reliably point at the new node).
     func coordinatorRequestFocusBlock(_ blockId: String)
+
+    /// Navigate to a tab/pane in ANOTHER workspace's window (task-pill click in
+    /// global mode). Implemented by the window controller via the WindowManager.
+    func coordinatorNavigateToWorkspace(_ workspaceId: String, tabId: String, blockId: String?)
     /// The coordinator finished binding its backend `window:<id>` and resolved the
     /// workspace it shows. `allWindowIds` is the client's full window list at bootstrap,
     /// so the WindowManager can fan out one NSWindow per remaining backend window
@@ -102,6 +106,7 @@ public extension AppCoordinatorDelegate {
     /// Default no-op so delegates without a tab "Background" submenu (and tests) compile.
     func coordinatorDidUpdateBackgroundPresets(_ presets: [TabBackgroundPreset]) {}
     func coordinatorDidBind(windowId: String, workspaceId: String, allWindowIds: [String]) {}
+    func coordinatorNavigateToWorkspace(_ workspaceId: String, tabId: String, blockId: String?) {}
     /// Default no-op so delegates without connection-picker UI (and tests) compile.
     func coordinatorPresentConnectionPicker(
         blockId: String, current: String?, connections: [String], onSelect: @escaping (String) -> Void) {}
@@ -299,10 +304,10 @@ public final class AppCoordinator {
             subscribeStandardEvents()
 
             // §7.6 — load client -> window -> workspace -> tab -> layout.
-            let window = try await loadWindow(windowId)
+            let window = try await withStartupRetry("loadWindow") { try await loadWindow(windowId) }
             let wsId = window.workspaceid
             workspaceId = wsId
-            let workspace = try await loadWorkspace(wsId)
+            let workspace = try await withStartupRetry("loadWorkspace") { try await loadWorkspace(wsId) }
 
             // §7.8 — scope waveobj:update to the workspace oref (GUARDS §B: scope
             // is the oref STRING).
@@ -659,8 +664,14 @@ public final class AppCoordinator {
     /// fallback matters after an app update/restart: the block is restored before its
     /// terminal has necessarily emitted another OSC 7 report. Internal so the
     /// WindowManager can inherit it for a new window.
+    ///
+    /// Both callers (new tab, new window) seed a LOCAL shell without inheriting the
+    /// pane's connection, so a REMOTE pane's cwd is a path on the wrong host — report
+    /// none and let the caller fall back to $HOME instead of poisoning the new block's
+    /// `cmd:cwd` with it.
     func focusedBlockCwd() -> String? {
         guard let blockId = currentFocusedBlockId() else { return nil }
+        if inheritedConnection(fromBlockId: blockId) != nil { return nil }
         return knownCwd(forBlockId: blockId)
     }
 
@@ -1561,6 +1572,21 @@ public final class AppCoordinator {
         return settings["notification:enabled"]?.boolValue ?? true
     }
 
+    /// Task-pill navigation: reveal a mentioned tab/pane. Own-workspace targets
+    /// resolve in this window; anything else routes to the workspace's window via
+    /// the delegate (WindowManager focuses or opens it).
+    public func navigate(toWorkspace targetWorkspaceId: String, tabId: String, blockId: String?) {
+        if targetWorkspaceId == workspaceId {
+            if let blockId {
+                revealBlock(tabId: tabId, blockId: blockId)
+            } else {
+                selectTab(tabId)
+            }
+            return
+        }
+        delegate?.coordinatorNavigateToWorkspace(targetWorkspaceId, tabId: tabId, blockId: blockId)
+    }
+
     /// Activate `tabId` and move focus to `blockId` (a desktop-notification click). The
     /// tab switch clears its badge via `activate`.
     public func revealBlock(tabId: String, blockId: String) {
@@ -1601,6 +1627,12 @@ public final class AppCoordinator {
         }
         let env = BlockEnvFactory(
             transport: transport, store: store, tabId: activeTabId, windowId: windowId,
+            workspaceId: workspaceId ?? "",
+            onNavigate: { [weak self] workspaceId, tabId, blockId in
+                Task { @MainActor in
+                    self?.navigate(toWorkspace: workspaceId, tabId: tabId, blockId: blockId)
+                }
+            },
             onSplit: { [weak self] blockId, direction in
                 Task { @MainActor in self?.splitFocusedBlock(blockId: blockId, direction: direction) }
             },
@@ -1684,11 +1716,33 @@ public final class AppCoordinator {
                 isCurrent: entry.workspaceid == workspaceId,
                 hasSavedLayout: (ws?.meta[WorkspaceMenuItem.savedLayoutMetaKey] ?? nil) != nil
             )
-        }
+        }.sorted { WorkspaceMenuItem.nameOrder($0.name, $1.name) }
         delegate?.coordinatorDidUpdateWorkspaceList(items)
     }
 
     // MARK: - Loads
+
+    /// Boot-path resilience: on initial start a busy backend (dozens of windows
+    /// booting while 100+ durable jobs reconnect) can stall RPC delivery past the
+    /// 5s default timeout, and a one-shot timeout would fatally alert the whole
+    /// window ("Wave failed to start"). Idempotent startup reads retry with
+    /// backoff instead. Non-timeout errors still fail fast — those are real.
+    private func withStartupRetry<T>(_ label: String, _ op: () async throws -> T) async throws -> T {
+        let maxAttempts = 5
+        var delayMs: UInt64 = 250
+        var attempt = 0
+        while true {
+            do {
+                return try await op()
+            } catch let error as WaveError {
+                attempt += 1
+                guard case .timeout = error, attempt < maxAttempts else { throw error }
+                NSLog("AppCoordinator: startup \(label) timed out (attempt \(attempt)/\(maxAttempts)), retrying")
+                try? await Task.sleep(nanoseconds: delayMs * 1_000_000)
+                delayMs = min(delayMs * 2, 2000)
+            }
+        }
+    }
 
     private func loadWindow(_ id: String) async throws -> Window {
         let obj = try await store.load(ORef.window(id))
@@ -1928,7 +1982,7 @@ public final class AppCoordinator {
     /// Widget views the native app actually RENDERS today. Widgets for other views
     /// would only show the placeholder, so they're hidden from the launcher until their
     /// native providers land (preview/sysinfo/processviewer).
-    static let implementedWidgetViews: Set<String> = ["term", "web"]
+    static let implementedWidgetViews: Set<String> = ["term", "web", "tasks"]
 
     public func widgetItems() -> [WidgetItem] {
         Self.parseWidgets(fullConfig).filter {

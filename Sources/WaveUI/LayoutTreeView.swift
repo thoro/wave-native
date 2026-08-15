@@ -1212,6 +1212,8 @@ public struct BlockEnvFactory: Sendable {
     let store: ObjectStoreProtocol
     let tabId: String
     let windowId: String
+    let workspaceId: String
+    let onNavigate: (@Sendable (String, String, String?) -> Void)?
     let onSplit: (@Sendable (String, String) -> Void)?
     let onMagnify: (@Sendable (String) -> Void)?
     let onClose: (@Sendable (String) -> Void)?
@@ -1227,6 +1229,8 @@ public struct BlockEnvFactory: Sendable {
 
     init(
         transport: WaveTransport, store: ObjectStoreProtocol, tabId: String, windowId: String,
+        workspaceId: String = "",
+        onNavigate: (@Sendable (String, String, String?) -> Void)? = nil,
         onSplit: (@Sendable (String, String) -> Void)? = nil,
         onMagnify: (@Sendable (String) -> Void)? = nil,
         onClose: (@Sendable (String) -> Void)? = nil,
@@ -1244,6 +1248,8 @@ public struct BlockEnvFactory: Sendable {
         self.store = store
         self.tabId = tabId
         self.windowId = windowId
+        self.workspaceId = workspaceId
+        self.onNavigate = onNavigate
         self.onSplit = onSplit
         self.onMagnify = onMagnify
         self.onClose = onClose
@@ -1261,7 +1267,9 @@ public struct BlockEnvFactory: Sendable {
     func makeEnv(blockRef: ORef) -> BlockEnv {
         BlockEnv(
             transport: transport, store: store, blockRef: blockRef,
-            tabId: tabId, windowId: windowId, onSplit: onSplit, onMagnify: onMagnify, onClose: onClose,
+            tabId: tabId, windowId: windowId,
+            workspaceId: workspaceId, onNavigate: onNavigate,
+            onSplit: onSplit, onMagnify: onMagnify, onClose: onClose,
             onPickConnection: onPickConnection, onOpenWebURL: onOpenWebURL, onRequestFocus: onRequestFocus,
             onBell: onBell, onNotification: onNotification, onClipboardCopy: onClipboardCopy,
             connections: connections, termThemes: termThemes, defaultTermThemeName: defaultTermThemeName)

@@ -114,6 +114,17 @@ public final class TerminalController: @unchecked Sendable {
     /// Monotonic id of the latest catch-up (or unmount). A catch-up retry loop
     /// exits when a newer catch-up supersedes it. Guarded by `lock`.
     private var catchUpGen = 0
+    /// True when a catch-up exhausted its retry budget with the reconciler still
+    /// unloaded. In that state every live append buffers invisibly — a frozen
+    /// pane with no recovery signal (no reconnect ever comes if the transport
+    /// stayed up). The next live append rearms ONE fresh catch-up cycle, so the
+    /// pane self-heals as soon as the shell produces output. Guarded by `lock`.
+    private var catchUpAbandoned = false
+    /// Catch-up retry budget/backoff; instance-level (defaults from
+    /// `TerminalConst`) so tests can shrink them to milliseconds.
+    var catchUpMaxAttempts = TerminalConst.catchUpMaxAttempts
+    var catchUpRetryBaseMs = TerminalConst.catchUpRetryBaseMs
+    var catchUpRetryCapMs = TerminalConst.catchUpRetryCapMs
     private var currentSize: TermSize
     /// Set once the view reports a real (laid-out) grid size via `resize`. The backfill
     /// MUST replay at the view's real width: a redrawing (\r-only) prompt fed at the wrong
@@ -381,6 +392,10 @@ public final class TerminalController: @unchecked Sendable {
         // Stop any in-flight catch-up retry loop (it checks the generation after
         // each backoff sleep) so a closed pane's controller can deallocate.
         catchUpGen += 1
+        // A stale abandoned flag must not survive into a remount: an append racing
+        // the next mount's tail backfill would rearm a catch-up that fights the
+        // mount path for the reconciler (and drops the history anchor).
+        catchUpAbandoned = false
         lock.unlock()
         token?.cancel()
     }
@@ -425,15 +440,18 @@ public final class TerminalController: @unchecked Sendable {
         // in `applyBackfill` — never delivered against the stale loaded reconciler at
         // the wrong offset (which would dup or mis-anchor the catch-up).
         let (gen, offset) = beginCatchUp()
-        for attempt in 1...TerminalConst.catchUpMaxAttempts {
+        for attempt in 1...catchUpMaxAttempts {
             do {
                 try await backfill(from: offset)
                 return
             } catch {
-                if attempt == TerminalConst.catchUpMaxAttempts { return }
+                if attempt == catchUpMaxAttempts {
+                    markCatchUpAbandoned(gen)
+                    return
+                }
                 let delayMs = min(
-                    TerminalConst.catchUpRetryBaseMs << (attempt - 1),
-                    TerminalConst.catchUpRetryCapMs)
+                    catchUpRetryBaseMs << (attempt - 1),
+                    catchUpRetryCapMs)
                 try? await Task.sleep(nanoseconds: delayMs * 1_000_000)
                 if Task.isCancelled || isCatchUpSuperseded(gen) { return }
             }
@@ -443,9 +461,18 @@ public final class TerminalController: @unchecked Sendable {
     private func beginCatchUp() -> (gen: Int, offset: Int64) {
         lock.lock(); defer { lock.unlock() }
         catchUpGen += 1
+        catchUpAbandoned = false
         let offset = reconciler.absOffset
         reconciler = TerminalReconciler(startOffset: offset)
         return (catchUpGen, offset)
+    }
+
+    /// Only the catch-up that is still the CURRENT one may flag abandonment —
+    /// a superseded loop's failure says nothing about the successor's state.
+    private func markCatchUpAbandoned(_ gen: Int) {
+        lock.lock(); defer { lock.unlock() }
+        guard gen == catchUpGen, !reconciler.loaded else { return }
+        catchUpAbandoned = true
     }
 
     private func isCatchUpSuperseded(_ gen: Int) -> Bool {
@@ -594,12 +621,21 @@ public final class TerminalController: @unchecked Sendable {
     // when a live event races the backfill (GUARDS §T).
 
     private func ingestAppend(_ data: Data) {
-        lock.lock(); defer { lock.unlock() }
+        lock.lock()
         let out = reconciler.append(data)
         if !out.isEmpty {
             _newlinesFed += Int64(out.reduce(0) { $1 == 0x0a ? $0 + 1 : $0 })
             sink.feed(out)
         }
+        // Rearm after an abandoned catch-up: this append just buffered invisibly
+        // (unloaded reconciler) and no retry loop is coming. One fresh cycle per
+        // rearm; `beginCatchUp` clears the flag so a failing backend can't spawn
+        // a loop per append.
+        let rearm = out.isEmpty && !reconciler.loaded && catchUpAbandoned && subToken != nil
+        if rearm { catchUpAbandoned = false }
+        lock.unlock()
+        guard rearm else { return }
+        Task { [weak self] in await self?.catchUp() }
     }
 
     private func ingestTruncate() {

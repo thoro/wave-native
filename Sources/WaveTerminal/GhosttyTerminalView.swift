@@ -19,6 +19,14 @@ import AppKit
 import CGhostty
 import WaveCore
 
+/// Env-gated selection tracing (WAVE_SELDEBUG=1): logs the click -> unified
+/// position mapping and the draw-side wash mapping, for diagnosing selections
+/// that land on the wrong row (each stage's row math in one line).
+func selLog(_ message: @autoclosure () -> String) {
+    guard ProcessInfo.processInfo.environment["WAVE_SELDEBUG"] != nil else { return }
+    NSLog("SELDBG %@", message())
+}
+
 /// Renders one terminal block and feeds keystrokes back to its controller.
 public final class GhosttyTerminalView: NSView {
     /// Raised on Cmd-D / Cmd-Shift-D to split the tab. Carries (this block's id,
@@ -138,7 +146,12 @@ public final class GhosttyTerminalView: NSView {
 
     /// Inclusive viewport-column range of a link (OSC-8 or autodetected URL) under the
     /// pointer while Cmd is held — drives the hover underline + the pointing-hand cursor.
-    private struct HoverLink { let row: Int; let cols: ClosedRange<Int> }
+    private struct HoverLink: Equatable {
+        struct Segment: Equatable { let row: Int; let cols: ClosedRange<Int> }
+        /// One column span per visual row the link covers; a soft-wrapped URL
+        /// spans several rows, so the underline needs a segment per row.
+        let segments: [Segment]
+    }
 
     /// The link currently Cmd-hovered, if any. nil clears the underline + cursor shape.
     private var hoverLink: HoverLink?
@@ -824,6 +837,7 @@ public final class GhosttyTerminalView: NSView {
         var cursorColor = defaultFg
         var sinkSbOffset = 0
         var sinkSbTotal = 0
+        var sinkScreenOrigin = 0
 
         // All libghostty-vt access (update + read) under the exclusive lock.
         sink.withTerminal { [weak self] terminal in
@@ -832,6 +846,10 @@ public final class GhosttyTerminalView: NSView {
             if ghostty_terminal_get(terminal, GHOSTTY_TERMINAL_DATA_SCROLLBAR, &sb) == GHOSTTY_SUCCESS {
                 sinkSbOffset = Int(sb.offset)
                 sinkSbTotal = Int(sb.total)
+            }
+            if self.virtualSelection != nil {
+                sinkScreenOrigin = self.sinkScreenOrigin(terminal)
+                selLog("draw origin=\(sinkScreenOrigin) sbOffset=\(sinkSbOffset) sel=\(String(describing: self.virtualSelection))")
             }
             guard ghostty_render_state_update(state, terminal) == GHOSTTY_SUCCESS else { return }
 
@@ -964,7 +982,7 @@ public final class GhosttyTerminalView: NSView {
             let textWidth = GhosttyTerminalView.textExtent(line)
             let rowSel: Range<Int>?
             if virtualSelection != nil {
-                rowSel = virtualSelectionCols(sinkViewportRow: row + sinkSbOffset, textWidth: textWidth)
+                rowSel = virtualSelectionCols(sinkScreenRow: row + sinkScreenOrigin, textWidth: textWidth)
             } else if row < selRanges.count, let native = selRanges[row] {
                 rowSel = GhosttyTerminalView.clampedSelectionCols(
                     lo: native.lowerBound, hi: native.upperBound + 1, textWidth: textWidth)
@@ -998,24 +1016,26 @@ public final class GhosttyTerminalView: NSView {
 
         // Cmd-hover link underline, drawn from the same snapshot (no terminal access here).
         // Each spanned cell is underlined in its own fg so a colored link stays consistent.
-        // hoverLink.row is a DRAW row: a history row when < histOnScreen, else a sink row.
-        if let hoverLink,
-           hoverLink.row >= 0, hoverLink.row < lastRows,
-           dirtyDrawRows.contains(hoverLink.row) {
-            let yUnderline = padV + CGFloat(hoverLink.row) * ch + ch - 2
-            if hoverLink.row < histOnScreen {
-                if let hrow = history.row(at: firstHistRow + hoverLink.row) {
-                    for col in hoverLink.cols where col >= 0 {
-                        let cell = historyCellSnapshot(hrow, col: col, defaultFg: defaultFg)
-                        cell.fg.setFill()
+        // Segment rows are DRAW rows: a history row when < histOnScreen, else a sink row.
+        // A soft-wrapped URL carries one segment per visual row it covers.
+        if let hoverLink {
+            for seg in hoverLink.segments
+            where seg.row >= 0 && seg.row < lastRows && dirtyDrawRows.contains(seg.row) {
+                let yUnderline = padV + CGFloat(seg.row) * ch + ch - 2
+                if seg.row < histOnScreen {
+                    if let hrow = history.row(at: firstHistRow + seg.row) {
+                        for col in seg.cols where col >= 0 {
+                            let cell = historyCellSnapshot(hrow, col: col, defaultFg: defaultFg)
+                            cell.fg.setFill()
+                            NSRect(x: padH + CGFloat(col) * cw, y: yUnderline, width: cw, height: 1).fill()
+                        }
+                    }
+                } else if seg.row - histOnScreen < grid.count {
+                    let line = grid[seg.row - histOnScreen]
+                    for col in seg.cols where col >= 0 && col < line.count {
+                        line[col].fg.setFill()
                         NSRect(x: padH + CGFloat(col) * cw, y: yUnderline, width: cw, height: 1).fill()
                     }
-                }
-            } else if hoverLink.row - histOnScreen < grid.count {
-                let line = grid[hoverLink.row - histOnScreen]
-                for col in hoverLink.cols where col >= 0 && col < line.count {
-                    line[col].fg.setFill()
-                    NSRect(x: padH + CGFloat(col) * cw, y: yUnderline, width: cw, height: 1).fill()
                 }
             }
         }
@@ -1055,10 +1075,9 @@ public final class GhosttyTerminalView: NSView {
         return GhosttyTerminalView.clampedSelectionCols(lo: lo, hi: hi, textWidth: textWidth)
     }
 
-    /// Columns of a SINK viewport row covered by the virtual selection. The sink
-    /// is pinned to its top while a virtual selection exists, so viewport row ==
-    /// SCREEN row.
-    private func virtualSelectionCols(sinkViewportRow row: Int, textWidth: Int) -> Range<Int>? {
+    /// Columns of a sink row (SCREEN coords, same basis as `.sink(screenRow:)`
+    /// positions) covered by the virtual selection.
+    private func virtualSelectionCols(sinkScreenRow row: Int, textWidth: Int) -> Range<Int>? {
         guard let sel = virtualSelection else { return nil }
         let (start, end) = sel.ordered
         let rowStart = UnifiedPos.sink(screenRow: row, col: 0)
@@ -1290,6 +1309,26 @@ public final class GhosttyTerminalView: NSView {
                     controller.sendInput(data)
                 }
             }
+            return
+        }
+
+        // Alt screen without mouse tracking (vi/less/htop with the mouse off):
+        // there is no scrollback to move, so the wheel becomes arrow-key presses —
+        // xterm "alternate scroll" (DEC mode 1007, default ON; apps can reset it).
+        // DECCKM (mode 1) picks SS3 vs CSI encoding, matching Ghostty proper.
+        if altScreenActive() {
+            var altScroll = true
+            var cursorApp = false
+            sink.withTerminal { terminal in
+                _ = ghostty_terminal_mode_get(terminal, GhosttyMode(1007), &altScroll)
+                _ = ghostty_terminal_mode_get(terminal, GhosttyMode(1), &cursorApp)
+            }
+            guard altScroll else { return }
+            let seq = GhosttyTerminalView.alternateScrollSequence(up: deltaY > 0, applicationCursorKeys: cursorApp)
+            let steps = max(1, Int((abs(deltaY) / cellSize.height).rounded()))
+            var data = Data()
+            for _ in 0..<steps { data.append(seq) }
+            controller.sendInput(data)
             return
         }
 
@@ -1762,14 +1801,117 @@ public final class GhosttyTerminalView: NSView {
                 return
             }
             if Task.isCancelled { return }
-            // In the sink layer: scroll to the match line's fraction and verify.
+            // In the sink layer: jump by occurrence ordinal (backend match
+            // order and sink-content order agree even where absolute line
+            // numbers drift); fall back to the fraction-scroll estimate when
+            // the walk can't run or comes up short.
             self.exitHistory()
+            self.historyHighlight = nil
+            if let ordinal = self.sinkMatchOrdinal(of: match), self.jumpSinkToOccurrence(ordinal, query: query) {
+                self.needsDisplay = true
+                return
+            }
             self.scrollSinkToLine(match.line)
             if !self.markCurrentMatchInVisibleSinkRows(query: query) {
                 self.pageWalkSinkToQuery(query)
             }
             self.needsDisplay = true
         }
+    }
+
+    /// 0-based position of `match` among the matches that live in the sink
+    /// (at/after the seam), i.e. which occurrence line it is counted from the
+    /// sink's top. Nil when the match should have resolved in history (the
+    /// caller already tried) — the ordinal would be meaningless.
+    private func sinkMatchOrdinal(of match: TermSearchMatch) -> Int? {
+        guard let idx = searchMatches.firstIndex(of: match) else { return nil }
+        let sinkStart = Swift.max(history.historyEndLine, history.anchor?.sinkBaseLine ?? 0)
+        let firstSinkIdx = searchMatches.firstIndex(where: { $0.line >= sinkStart }) ?? searchMatches.count
+        let ordinal = idx - firstSinkIdx
+        return ordinal >= 0 ? ordinal : nil
+    }
+
+    /// Jump to the ordinal-th logical line containing `query` counted from the
+    /// sink's top: walk every sink row, find the occurrence line, center it,
+    /// and mark the match start as the current find result. Returns false
+    /// (leaving no marker) when the sink is too large to walk, a render call
+    /// fails, or fewer occurrence lines exist than `ordinal` (live output has
+    /// shifted content since the backend search).
+    private func jumpSinkToOccurrence(_ ordinal: Int, query: String) -> Bool {
+        guard let rows = collectSinkRows(),
+              let hit = TermLogicalLine.nthOccurrence(rows: rows, needle: query, n: ordinal),
+              let sb = sinkScrollbarState() else { return false }
+        scrollSink(toOffset: Swift.max(0, Swift.min(Swift.max(0, sb.total - sb.len), hit.row - sb.len / 2)))
+        var found = false
+        sink.withTerminal { [weak self] terminal in
+            guard let self else { return }
+            var point = GhosttyPoint()
+            point.tag = GHOSTTY_POINT_TAG_SCREEN
+            point.value.coordinate = GhosttyPointCoordinate(x: UInt16(hit.col), y: UInt32(hit.row))
+            var ref: GhosttyTrackedGridRef?
+            guard ghostty_terminal_grid_ref_track(terminal, point, &ref) == GHOSTTY_SUCCESS, let ref else { return }
+            self.replaceSinkFindCurrentLocked(with: ref)
+            found = true
+        }
+        return found
+    }
+
+    /// Sink-row budget for the ordinal walk; anything larger falls back to the
+    /// fraction-scroll estimate (the walk pages the whole viewport through the
+    /// sink under one lock, so its cost is linear in total rows).
+    private static let maxOrdinalWalkRows = 50_000
+
+    /// Snapshot every sink row's text + soft-wrap flag top to bottom by paging
+    /// the viewport under a single terminal lock (blocking the feed keeps the
+    /// snapshot consistent). The viewport is left where the walk ended; the
+    /// caller scrolls to its target afterwards.
+    private func collectSinkRows() -> [TermRowSlice]? {
+        var result: [TermRowSlice]?
+        sink.withTerminal { [weak self] terminal in
+            guard let self, let state = self.renderState,
+                  var it = self.rowIterator, var cells = self.rowCells else { return }
+            var sb = GhosttyTerminalScrollbar()
+            guard ghostty_terminal_get(terminal, GHOSTTY_TERMINAL_DATA_SCROLLBAR, &sb) == GHOSTTY_SUCCESS else { return }
+            let total = Int(sb.total)
+            guard total > 0, total <= Self.maxOrdinalWalkRows else { return }
+            var top = GhosttyTerminalScrollViewport()
+            top.tag = GHOSTTY_SCROLL_VIEWPORT_TOP
+            ghostty_terminal_scroll_viewport(terminal, top)
+            var rows: [TermRowSlice] = []
+            rows.reserveCapacity(total)
+            while rows.count < total {
+                guard ghostty_terminal_get(terminal, GHOSTTY_TERMINAL_DATA_SCROLLBAR, &sb) == GHOSTTY_SUCCESS,
+                      ghostty_render_state_update(state, terminal) == GHOSTTY_SUCCESS else { return }
+                // On the clamped final page the viewport overlaps rows already
+                // captured; skip those.
+                let skip = rows.count - Int(sb.offset)
+                ghostty_render_state_get(state, GHOSTTY_RENDER_STATE_DATA_ROW_ITERATOR, &it)
+                var pageRow = 0
+                while ghostty_render_state_row_iterator_next(it) {
+                    defer { pageRow += 1 }
+                    if pageRow < skip { continue }
+                    if rows.count >= total { break }
+                    guard ghostty_render_state_row_get(it, GHOSTTY_RENDER_STATE_ROW_DATA_CELLS, &cells) == GHOSTTY_SUCCESS else { return }
+                    let (line, offsets) = GhosttyTerminalView.rowLine(cells: cells)
+                    var wrapped = false
+                    // Out-param must be a NON-optional GhosttyRow: the C side writes
+                    // only the 8-byte payload, so an Optional's tag byte stays "nil"
+                    // and `if let` silently drops the row (wrap flags read as false).
+                    var raw: GhosttyRow = 0
+                    if ghostty_render_state_row_get(it, GHOSTTY_RENDER_STATE_ROW_DATA_RAW, &raw) == GHOSTTY_SUCCESS {
+                        _ = ghostty_row_get(raw, GHOSTTY_ROW_DATA_WRAP, &wrapped)
+                    }
+                    rows.append(TermRowSlice(row: rows.count, text: line, offsets: offsets, wrapped: wrapped))
+                }
+                if Int(sb.offset) + Int(sb.len) >= total { break }
+                var d = GhosttyTerminalScrollViewport()
+                d.tag = GHOSTTY_SCROLL_VIEWPORT_DELTA
+                d.value.delta = Int(sb.len)
+                ghostty_terminal_scroll_viewport(terminal, d)
+            }
+            result = rows
+        }
+        return result
     }
 
     /// Scroll the sink viewport so the given logical line is roughly centered.
@@ -2067,9 +2209,16 @@ public final class GhosttyTerminalView: NSView {
         // Multi-click: word (2) / line (3+) selection in the unified model --
         // identical in live and history rows, and drags keep the granularity.
         if event.clickCount >= 2 {
-            guard let pos = unifiedHit(p) else { return }
+            guard let pos = unifiedHit(p) else {
+                selLog("multiclick p=\(p) -> unifiedHit nil (unparsed history row?)")
+                return
+            }
             let granularity: SelectionGranularity = event.clickCount >= 3 ? .line : .word
             let range = unifiedRange(at: pos, granularity: granularity)
+            selLog(
+                "multiclick p=\(p) cell=\(cellSize) padV=\(padV) drawRow=\(Int((p.y - padV) / cellSize.height)) "
+                + "hos=\(histRowsOnScreen) histScroll=\(historyScrollRows) alt=\(altScreenActive()) "
+                + "hit=\(pos) range=\(range.0)..\(range.1)")
             selectionGranularity = granularity
             granularityAnchorRange = range
             virtualSelection = VirtualSelection(anchor: range.0, head: range.1)
@@ -2313,10 +2462,7 @@ public final class GhosttyTerminalView: NSView {
         } else {
             var off = 0
             sink.withTerminal { terminal in
-                var sb = GhosttyTerminalScrollbar()
-                if ghostty_terminal_get(terminal, GHOSTTY_TERMINAL_DATA_SCROLLBAR, &sb) == GHOSTTY_SUCCESS {
-                    off = Int(sb.offset)
-                }
+                off = self.sinkScreenOrigin(terminal)
             }
             first = histTotal + off
         }
@@ -2560,6 +2706,19 @@ public final class GhosttyTerminalView: NSView {
         return (Int(out.x), Int(out.y))
     }
 
+    /// SCREEN row of the sink's top visible viewport row, derived from the same
+    /// grid-ref conversion that produces `.sink(screenRow:)` positions. NOT the
+    /// scrollbar offset: ghostty's scrollbar deliberately reports offset 0 for
+    /// no-scrollback screens (vi's alt screen) even when the page list holds
+    /// grown rows above the active area, while SCREEN points count those rows —
+    /// converting through the scrollbar there shifts every selection down.
+    private func sinkScreenOrigin(_ terminal: GhosttyTerminal) -> Int {
+        if let sc = screenCoord(terminal, col: 0, row: 0) { return sc.row }
+        var sb = GhosttyTerminalScrollbar()
+        guard ghostty_terminal_get(terminal, GHOSTTY_TERMINAL_DATA_SCROLLBAR, &sb) == GHOSTTY_SUCCESS else { return 0 }
+        return Int(sb.offset)
+    }
+
     /// Start (or keep) the edge auto-scroll while the pointer is dragged past the top or
     /// bottom of the grid; stop it once the pointer is back inside.
     private func updateAutoScroll(for event: NSEvent) {
@@ -2706,52 +2865,105 @@ public final class GhosttyTerminalView: NSView {
         return String(decoding: buf.prefix(written), as: UTF8.self)
     }
 
-    /// Resolve a plain (non-OSC-8) URL under a mouse event, if any. Reads the
-    /// clicked viewport row's text from the render state and asks the pure
-    /// `TerminalURLDetect` helper for the URL token covering the clicked column.
-    /// Skipped while mouse tracking is on (the app owns the mouse then). Runs under
-    /// the existing `withTerminal` lock on the same UI/draw path as rendering — no
-    /// new locking on the controller feed path.
+    /// Contiguous history rows around a history DRAW row for soft-wrap joining.
+    /// May extend above the visible top (negative draw rows) since the history
+    /// model holds those rows anyway — a URL whose head scrolled just off-screen
+    /// still resolves fully. Returns the slices plus the anchor row's index in
+    /// them, or nil when the anchor row itself is unavailable.
+    private func historySlices(around drawRow: Int) -> (slices: [TermRowSlice], index: Int)? {
+        let total = history.totalRows()
+        let baseAbs = total - Swift.min(historyScrollRows, total)
+        var slices: [TermRowSlice] = []
+        var anchor: Int?
+        for r in (drawRow - TermLogicalLine.MaxJoinRows)...(drawRow + TermLogicalLine.MaxJoinRows) {
+            guard let hrow = history.row(at: baseAbs + r) else {
+                // A missing row (out of bounds / chunk not loaded) breaks the
+                // run: restart above the anchor, stop below it.
+                if r < drawRow {
+                    slices.removeAll()
+                    continue
+                }
+                break
+            }
+            if r == drawRow { anchor = slices.count }
+            slices.append(TermRowSlice(row: r, text: hrow.plain, offsets: hrow.offsets, wrapped: hrow.wrapped))
+        }
+        guard let anchor else { return nil }
+        return (slices, anchor)
+    }
+
+    /// Flatten the sink viewport rows around `row` (±MaxJoinRows) with their
+    /// soft-wrap flags, for soft-wrap joining. Must be called inside
+    /// `withTerminal` after a successful render-state update.
+    private func sinkSlices(around row: Int) -> (slices: [TermRowSlice], index: Int)? {
+        guard let state = renderState, var it = rowIterator, var cells = rowCells else { return nil }
+        ghostty_render_state_get(state, GHOSTTY_RENDER_STATE_DATA_ROW_ITERATOR, &it)
+        var slices: [TermRowSlice] = []
+        var anchor: Int?
+        var idx = 0
+        while ghostty_render_state_row_iterator_next(it) {
+            defer { idx += 1 }
+            if idx < row - TermLogicalLine.MaxJoinRows { continue }
+            if idx > row + TermLogicalLine.MaxJoinRows { break }
+            guard ghostty_render_state_row_get(it, GHOSTTY_RENDER_STATE_ROW_DATA_CELLS, &cells) == GHOSTTY_SUCCESS else { return nil }
+            let (line, offsets) = GhosttyTerminalView.rowLine(cells: cells)
+            var wrapped = false
+            // Non-optional out-param: see the matching comment in collectSinkRows.
+            var raw: GhosttyRow = 0
+            if ghostty_render_state_row_get(it, GHOSTTY_RENDER_STATE_ROW_DATA_RAW, &raw) == GHOSTTY_SUCCESS {
+                _ = ghostty_row_get(raw, GHOSTTY_ROW_DATA_WRAP, &wrapped)
+            }
+            if idx == row { anchor = slices.count }
+            slices.append(TermRowSlice(row: idx, text: line, offsets: offsets, wrapped: wrapped))
+        }
+        guard let anchor else { return nil }
+        return (slices, anchor)
+    }
+
+    /// Resolve a plain (non-OSC-8) URL under a mouse event, if any. Joins the
+    /// clicked row's soft-wrap run into one logical line (a narrow pane wraps
+    /// long URLs over several rows) and asks the pure `TerminalURLDetect` helper
+    /// for the URL token covering the clicked column. Skipped while mouse
+    /// tracking is on (the app owns the mouse then). Runs under the existing
+    /// `withTerminal` lock on the same UI/draw path as rendering — no new
+    /// locking on the controller feed path. A wrap run straddling the
+    /// history/sink seam is not joined across it (each side resolves locally).
     func autodetectedURL(for event: NSEvent) -> String? {
         guard !mouseTrackingEnabled() else { return nil }
         var (col, row) = gridCoord(for: event)
-        if let hrow = historyRow(atDrawRow: row) {
-            guard col >= 0, col < hrow.offsets.count else { return nil }
-            return TerminalURLDetect.urlAt(line: hrow.plain, column: hrow.offsets[col])
+        if row < histRowsOnScreen {
+            guard let (slices, index) = historySlices(around: row),
+                  let line = TermLogicalLine.around(rows: slices, index: index),
+                  let offset = line.utf16Offset(row: row, col: col) else { return nil }
+            return TerminalURLDetect.urlAt(line: line.text, column: offset)
         }
         row -= histRowsOnScreen
         var result: String?
         sink.withTerminal { [weak self] terminal in
             guard let self, let state = self.renderState else { return }
             guard ghostty_render_state_update(state, terminal) == GHOSTTY_SUCCESS else { return }
-            guard var it = self.rowIterator, var cells = self.rowCells else { return }
-            ghostty_render_state_get(state, GHOSTTY_RENDER_STATE_DATA_ROW_ITERATOR, &it)
-            var idx = 0
-            while ghostty_render_state_row_iterator_next(it) {
-                if idx == row {
-                    guard ghostty_render_state_row_get(it, GHOSTTY_RENDER_STATE_ROW_DATA_CELLS, &cells) == GHOSTTY_SUCCESS else { return }
-                    let (line, offsets) = GhosttyTerminalView.rowLine(cells: cells)
-                    guard col >= 0, col < offsets.count else { return }
-                    result = TerminalURLDetect.urlAt(line: line, column: offsets[col])
-                    return
-                }
-                idx += 1
-            }
+            guard let (slices, index) = self.sinkSlices(around: row),
+                  let line = TermLogicalLine.around(rows: slices, index: index),
+                  let offset = line.utf16Offset(row: row, col: col) else { return }
+            result = TerminalURLDetect.urlAt(line: line.text, column: offset)
         }
         return result
     }
 
     /// Resolve a filesystem path under a mouse event when the clicked token is an EXISTING
-    /// file or directory. Reads the clicked row's text on the same path as `autodetectedURL`,
-    /// asks the pure `TerminalPathDetect` for the path token, then resolves it against the
-    /// pane's CWD and stats it — only existing paths return non-nil, so a click on ordinary
-    /// `a/b` prose with no such file falls through to local selection.
+    /// file or directory. Reads the clicked row's soft-wrap run on the same path as
+    /// `autodetectedURL`, asks the pure `TerminalPathDetect` for the path token, then
+    /// resolves it against the pane's CWD and stats it — only existing paths return
+    /// non-nil, so a click on ordinary `a/b` prose with no such file falls through to
+    /// local selection.
     func autodetectedPath(for event: NSEvent) -> URL? {
         guard !mouseTrackingEnabled() else { return nil }
         var (col, row) = gridCoord(for: event)
-        if let hrow = historyRow(atDrawRow: row) {
-            guard col >= 0, col < hrow.offsets.count,
-                  let path = TerminalPathDetect.pathRangeAt(line: hrow.plain, column: hrow.offsets[col])?.path
+        if row < histRowsOnScreen {
+            guard let (slices, index) = historySlices(around: row),
+                  let line = TermLogicalLine.around(rows: slices, index: index),
+                  let offset = line.utf16Offset(row: row, col: col),
+                  let path = TerminalPathDetect.pathRangeAt(line: line.text, column: offset)?.path
             else { return nil }
             return resolveExistingPath(path)
         }
@@ -2760,19 +2972,10 @@ public final class GhosttyTerminalView: NSView {
         sink.withTerminal { [weak self] terminal in
             guard let self, let state = self.renderState else { return }
             guard ghostty_render_state_update(state, terminal) == GHOSTTY_SUCCESS else { return }
-            guard var it = self.rowIterator, var cells = self.rowCells else { return }
-            ghostty_render_state_get(state, GHOSTTY_RENDER_STATE_DATA_ROW_ITERATOR, &it)
-            var idx = 0
-            while ghostty_render_state_row_iterator_next(it) {
-                if idx == row {
-                    guard ghostty_render_state_row_get(it, GHOSTTY_RENDER_STATE_ROW_DATA_CELLS, &cells) == GHOSTTY_SUCCESS else { return }
-                    let (line, offsets) = GhosttyTerminalView.rowLine(cells: cells)
-                    guard col >= 0, col < offsets.count else { return }
-                    token = TerminalPathDetect.pathRangeAt(line: line, column: offsets[col])?.path
-                    return
-                }
-                idx += 1
-            }
+            guard let (slices, index) = self.sinkSlices(around: row),
+                  let line = TermLogicalLine.around(rows: slices, index: index),
+                  let offset = line.utf16Offset(row: row, col: col) else { return }
+            token = TerminalPathDetect.pathRangeAt(line: line.text, column: offset)?.path
         }
         guard let token else { return nil }
         return resolveExistingPath(token)
@@ -3003,34 +3206,34 @@ public final class GhosttyTerminalView: NSView {
     /// Store the hovered link and, when it actually changed, re-evaluate the pointer shape
     /// (I-beam ↔ pointing-hand) and repaint so the underline appears/clears.
     private func setHoverLink(_ link: HoverLink?) {
-        if link?.row == hoverLink?.row, link?.cols == hoverLink?.cols { return }
+        if link == hoverLink { return }
         hoverLink = link
         window?.invalidateCursorRects(for: self)
         needsDisplay = true
     }
 
     /// Resolve the link (OSC-8 first, then an autodetected plain URL) covering a viewport
-    /// cell and return its inclusive column range on that row, for the hover underline +
-    /// pointer shape. Reads cells under the SAME `withTerminal` lock the draw path uses —
-    /// no new locking on the controller feed path (preserves the terminal-query freeze fix).
+    /// cell and return its per-row column spans, for the hover underline + pointer shape.
+    /// Autodetection runs on the hovered row's soft-wrap run, so a URL wrapped over
+    /// several rows underlines across all of them. Reads cells under the SAME
+    /// `withTerminal` lock the draw path uses — no new locking on the controller feed
+    /// path (preserves the terminal-query freeze fix).
     private func hoveredLink(col: Int, row: Int) -> HoverLink? {
-        // History rows: link spans + URL/path detection from the parsed row.
+        // History rows: link spans + URL/path detection from the parsed rows.
         if row < histRowsOnScreen {
             guard let hrow = historyRow(atDrawRow: row) else { return nil }
             if let span = hrow.link(at: col) {
-                return HoverLink(row: row, cols: span.cols)
+                return HoverLink(segments: [.init(row: row, cols: span.cols)])
             }
-            guard col >= 0, col < hrow.offsets.count else { return nil }
-            if let (_, range) = TerminalURLDetect.urlRangeAt(line: hrow.plain, column: hrow.offsets[col]),
-               let cols = GhosttyTerminalView.columnRange(
-                   offsets: hrow.offsets, utf16Lower: range.location, utf16Upper: range.location + range.length) {
-                return HoverLink(row: row, cols: cols)
+            guard let (slices, index) = historySlices(around: row),
+                  let line = TermLogicalLine.around(rows: slices, index: index),
+                  let offset = line.utf16Offset(row: row, col: col) else { return nil }
+            if let (_, range) = TerminalURLDetect.urlRangeAt(line: line.text, column: offset) {
+                return makeHoverLink(line: line, range: range)
             }
-            if let (path, range) = TerminalPathDetect.pathRangeAt(line: hrow.plain, column: hrow.offsets[col]),
-               resolveExistingPath(path) != nil,
-               let cols = GhosttyTerminalView.columnRange(
-                   offsets: hrow.offsets, utf16Lower: range.location, utf16Upper: range.location + range.length) {
-                return HoverLink(row: row, cols: cols)
+            if let (path, range) = TerminalPathDetect.pathRangeAt(line: line.text, column: offset),
+               resolveExistingPath(path) != nil {
+                return makeHoverLink(line: line, range: range)
             }
             return nil
         }
@@ -3045,40 +3248,38 @@ public final class GhosttyTerminalView: NSView {
                 while lo > 0, self.hyperlinkURIAt(terminal, col: lo - 1, row: sinkRow) == uri { lo -= 1 }
                 let maxCol = max(0, self.lastCols - 1)
                 while hi < maxCol, self.hyperlinkURIAt(terminal, col: hi + 1, row: sinkRow) == uri { hi += 1 }
-                result = HoverLink(row: row, cols: lo...hi)
+                result = HoverLink(segments: [.init(row: row, cols: lo...hi)])
                 return
             }
-            // Autodetected URL: flatten the hovered row and map the URL's char range back
-            // to columns via the offset table.
+            // Autodetected URL: join the hovered row's soft-wrap run and map the URL's
+            // char range back to per-row columns via the offset tables.
             guard let state = self.renderState,
                   ghostty_render_state_update(state, terminal) == GHOSTTY_SUCCESS,
-                  var it = self.rowIterator, var cells = self.rowCells else { return }
-            ghostty_render_state_get(state, GHOSTTY_RENDER_STATE_DATA_ROW_ITERATOR, &it)
-            var idx = 0
-            while ghostty_render_state_row_iterator_next(it) {
-                defer { idx += 1 }
-                guard idx == sinkRow else { continue }
-                guard ghostty_render_state_row_get(it, GHOSTTY_RENDER_STATE_ROW_DATA_CELLS, &cells) == GHOSTTY_SUCCESS else { return }
-                let (line, offsets) = GhosttyTerminalView.rowLine(cells: cells)
-                guard col >= 0, col < offsets.count else { return }
-                if let (_, range) = TerminalURLDetect.urlRangeAt(line: line, column: offsets[col]),
-                   let cols = GhosttyTerminalView.columnRange(
-                       offsets: offsets, utf16Lower: range.location, utf16Upper: range.location + range.length) {
-                    result = HoverLink(row: row, cols: cols)
-                    return
-                }
-                // Fall back to an existing-file path token (Cmd-click opens it too).
-                if let (path, range) = TerminalPathDetect.pathRangeAt(line: line, column: offsets[col]),
-                   self.resolveExistingPath(path) != nil,
-                   let cols = GhosttyTerminalView.columnRange(
-                       offsets: offsets, utf16Lower: range.location, utf16Upper: range.location + range.length) {
-                    result = HoverLink(row: row, cols: cols)
-                    return
-                }
+                  let (slices, index) = self.sinkSlices(around: sinkRow),
+                  let line = TermLogicalLine.around(rows: slices, index: index),
+                  let offset = line.utf16Offset(row: sinkRow, col: col) else { return }
+            if let (_, range) = TerminalURLDetect.urlRangeAt(line: line.text, column: offset) {
+                result = self.makeHoverLink(line: line, range: range, rowOffset: self.histRowsOnScreen)
                 return
+            }
+            // Fall back to an existing-file path token (Cmd-click opens it too).
+            if let (path, range) = TerminalPathDetect.pathRangeAt(line: line.text, column: offset),
+               self.resolveExistingPath(path) != nil {
+                result = self.makeHoverLink(line: line, range: range, rowOffset: self.histRowsOnScreen)
             }
         }
         return result
+    }
+
+    /// Convert a matched UTF-16 range on a joined logical line into a HoverLink,
+    /// translating slice rows to draw rows via `rowOffset` (0 for history rows,
+    /// `histRowsOnScreen` for sink rows).
+    private func makeHoverLink(line: TermLogicalLine, range: NSRange, rowOffset: Int = 0) -> HoverLink? {
+        let segments = line.segments(in: range).map {
+            HoverLink.Segment(row: $0.row + rowOffset, cols: $0.cols)
+        }
+        guard !segments.isEmpty else { return nil }
+        return HoverLink(segments: segments)
     }
 
     /// Every case-insensitive occurrence of `needle` in a row's text, as cell
@@ -3102,17 +3303,10 @@ public final class GhosttyTerminalView: NSView {
 
     /// Map a UTF-16 character range in a row's flattened string back to the inclusive
     /// viewport column range it covers, via the per-column offset table from `rowLine`.
-    /// A column is included when its start offset lies within [lower, upper). Pure so it
-    /// is unit-testable (the integration row read is not).
+    /// The implementation lives on `TermLogicalLine` (Foundation-only, unit-testable);
+    /// this forwarder keeps the view's historical call sites/tests working.
     static func columnRange(offsets: [Int], utf16Lower: Int, utf16Upper: Int) -> ClosedRange<Int>? {
-        var lo = -1
-        var hi = -1
-        for (col, off) in offsets.enumerated() where off >= utf16Lower && off < utf16Upper {
-            if lo < 0 { lo = col }
-            hi = col
-        }
-        guard lo >= 0 else { return nil }
-        return lo...hi
+        TermLogicalLine.columnRange(offsets: offsets, utf16Lower: utf16Lower, utf16Upper: utf16Upper)
     }
 
     // MARK: - Copy (selection.h format -> NSPasteboard)
@@ -3382,14 +3576,10 @@ public final class GhosttyTerminalView: NSView {
     private func sinkRef(
         _ terminal: GhosttyTerminal, col: Int, screenRow: Int
     ) -> GhosttyGridRef? {
-        var scrollbar = GhosttyTerminalScrollbar()
-        if ghostty_terminal_get(
-            terminal, GHOSTTY_TERMINAL_DATA_SCROLLBAR, &scrollbar) == GHOSTTY_SUCCESS {
-            let viewportRow = screenRow - Int(scrollbar.offset)
-            if viewportRow >= 0, viewportRow < Int(scrollbar.len),
-               let ref = gridRef(terminal, col: col, row: viewportRow) {
-                return ref
-            }
+        let viewportRow = screenRow - sinkScreenOrigin(terminal)
+        if viewportRow >= 0, viewportRow < lastRows,
+           let ref = gridRef(terminal, col: col, row: viewportRow) {
+            return ref
         }
         return screenRef(terminal, col: col, row: screenRow)
     }
@@ -3612,6 +3802,13 @@ public final class GhosttyTerminalView: NSView {
     public override func becomeFirstResponder() -> Bool {
         hasKeyFocus = true
         needsDisplay = true // repaint the cursor as a filled block
+        // Re-assert the pty winsize on focus. The pty size can drift from the view's
+        // grid (durable-shell reattach, remote reconnect, missed SIGWINCH) and
+        // updateTerminalSize dedupes on lastCols/lastRows so it never re-sends;
+        // this catch-all heals TUIs (e.g. Claude Code) stuck at a stale size.
+        if lastCols > 0, lastRows > 0 {
+            controller.resize(TermSize(rows: lastRows, cols: lastCols))
+        }
         return true
     }
     public override func resignFirstResponder() -> Bool {
@@ -3719,6 +3916,13 @@ public final class GhosttyTerminalView: NSView {
     /// Cursor/Home/End: `ESC[<final>` unmodified, else `ESC[1;<mod><final>`.
     static func csiCursor(_ final: String, _ mod: Int) -> Data {
         mod == 1 ? esc("[\(final)") : esc("[1;\(mod)\(final)")
+    }
+
+    /// Alternate-scroll wheel encoding (DEC 1007): one cursor Up/Down per wheel
+    /// step, SS3 (`ESC O`) when DECCKM application cursor keys are set, CSI otherwise.
+    static func alternateScrollSequence(up: Bool, applicationCursorKeys: Bool) -> Data {
+        let final = up ? "A" : "B"
+        return esc(applicationCursorKeys ? "O\(final)" : "[\(final)")
     }
 
     /// Page/Delete: `ESC[<n>~` unmodified, else `ESC[<n>;<mod>~`.

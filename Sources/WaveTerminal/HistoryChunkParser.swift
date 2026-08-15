@@ -30,8 +30,13 @@ final class HistoryChunkParser {
 
     struct ParseResult {
         var rows: [TermHistoryRow]
-        /// Index into `rows` where each logical line starts (rows with the
-        /// wrap-continuation flag cleared). Used to map logical lines <-> rows.
+        /// Index into `rows` where each RAW line (one per \n byte in the fed
+        /// data, matching the backend's filestore line numbering) starts.
+        /// Recorded from the cursor position while feeding — NOT derived from
+        /// wrap-continuation flags, which drift from raw-\n space whenever a
+        /// program starts a new visual row without emitting \n (readline
+        /// hard-wraps, NEL/CNL, cursor motion). Used to map logical lines <->
+        /// rows.
         var lineStartRows: [Int]
     }
 
@@ -82,19 +87,39 @@ final class HistoryChunkParser {
             }
         }
 
-        // Feed in slices so a cancelled parse stops promptly.
-        let sliceSize = 256 * 1024
+        // Feed line by line (split at \n) and record the cursor's absolute row
+        // after each newline: rawStarts[i] = row where raw line i begins. The
+        // scratch cap is far above any chunk, so no pruning ever shifts these.
+        // Values are clamped ascending because cursor motion inside TUI redraws
+        // can move upward; those lines are fuzzy either way.
+        var rawStarts: [Int] = [0]
         var fed = 0
+        var sinceCancelCheck = 0
         bytes.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
             guard let base = raw.baseAddress else { return }
             while fed < bytes.count {
-                if isCancelled() { return }
-                let n = min(sliceSize, bytes.count - fed)
-                ghostty_terminal_vt_write(terminal, base.advanced(by: fed).assumingMemoryBound(to: UInt8.self), n)
+                if sinceCancelCheck > 256 * 1024 {
+                    sinceCancelCheck = 0
+                    if isCancelled() { return }
+                }
+                let remaining = bytes.count - fed
+                let cur = base.advanced(by: fed)
+                let nl = memchr(cur, 0x0A, remaining)
+                let n = nl.map { UnsafeRawPointer($0) - cur + 1 } ?? remaining
+                ghostty_terminal_vt_write(terminal, cur.assumingMemoryBound(to: UInt8.self), n)
                 fed += n
+                sinceCancelCheck += n
+                if nl != nil {
+                    rawStarts.append(max(rawStarts[rawStarts.count - 1], cursorAbsoluteRow(terminal)))
+                }
             }
         }
         if isCancelled() { return nil }
+        // One entry per raw line actually present: data ending in \n has no
+        // trailing partial line, so the last recorded start begins nothing.
+        if bytes.isEmpty || bytes.last == 0x0A {
+            rawStarts.removeLast()
+        }
 
         var state: GhosttyRenderState?
         var it: GhosttyRenderStateRowIterator?
@@ -146,28 +171,30 @@ final class HistoryChunkParser {
             rows.removeLast()
         }
 
-        // Drop warm-up rows: skip whole logical lines (a logical line starts at
-        // each non-continuation row).
+        // Drop warm-up rows by RAW line boundary (the caller fetched exactly
+        // `warmupLines` extra raw lines in front of the chunk).
         if warmupLines > 0 {
-            var linesSeen = 0
-            var dropCount = rows.count
-            for (idx, row) in rows.enumerated() {
-                if !row.isContinuation {
-                    if linesSeen == warmupLines {
-                        dropCount = idx
-                        break
-                    }
-                    linesSeen += 1
-                }
-            }
-            rows.removeFirst(min(dropCount, rows.count))
+            let dropCount = min(warmupLines < rawStarts.count ? rawStarts[warmupLines] : rows.count, rows.count)
+            rows.removeFirst(dropCount)
+            rawStarts = warmupLines < rawStarts.count
+                ? rawStarts[warmupLines...].map { $0 - dropCount } : []
         }
 
-        var lineStartRows: [Int] = []
-        for (idx, row) in rows.enumerated() where !row.isContinuation {
-            lineStartRows.append(idx)
-        }
+        // Entries can point past the end after trailing-blank trimming (a raw
+        // line whose rows were all blank); clamp so row lookups stay in range.
+        let lineStartRows = rawStarts.map { min(max(0, $0), rows.count) }
         return ParseResult(rows: rows, lineStartRows: lineStartRows)
+    }
+
+    /// Absolute row (scrollback rows above the active area + active-area
+    /// cursor y) of the scratch terminal's cursor, in the same row space the
+    /// page-by-page extraction below indexes.
+    private static func cursorAbsoluteRow(_ terminal: GhosttyTerminal) -> Int {
+        var scrollback = 0
+        _ = ghostty_terminal_get(terminal, GHOSTTY_TERMINAL_DATA_SCROLLBACK_ROWS, &scrollback)
+        var y: UInt16 = 0
+        _ = ghostty_terminal_get(terminal, GHOSTTY_TERMINAL_DATA_CURSOR_Y, &y)
+        return scrollback + Int(y)
     }
 
     private static func extractRow(
@@ -179,8 +206,11 @@ final class HistoryChunkParser {
         var wrapped = false
         var isContinuation = false
         var hasHyperlink = false
-        var raw: GhosttyRow?
-        if ghostty_render_state_row_get(it, GHOSTTY_RENDER_STATE_ROW_DATA_RAW, &raw) == GHOSTTY_SUCCESS, let raw {
+        // Out-param must be a NON-optional GhosttyRow: the C side writes only the
+        // 8-byte payload, so an Optional's tag byte stays "nil" and `if let`
+        // silently drops the row (all flags read as false).
+        var raw: GhosttyRow = 0
+        if ghostty_render_state_row_get(it, GHOSTTY_RENDER_STATE_ROW_DATA_RAW, &raw) == GHOSTTY_SUCCESS {
             _ = ghostty_row_get(raw, GHOSTTY_ROW_DATA_WRAP, &wrapped)
             _ = ghostty_row_get(raw, GHOSTTY_ROW_DATA_WRAP_CONTINUATION, &isContinuation)
             _ = ghostty_row_get(raw, GHOSTTY_ROW_DATA_HYPERLINK, &hasHyperlink)

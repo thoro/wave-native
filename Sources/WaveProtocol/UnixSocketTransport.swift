@@ -229,12 +229,50 @@ public final class UnixHTTPFetcher: HTTPFetching {
 
 // MARK: - ws message channel over a unix socket
 
+/// Newline-framed line extractor with amortized O(1) consumption. Consumed bytes
+/// are trimmed only when the buffer runs dry: rebuilding the buffer per
+/// extracted line is O(buffered²) — one 1MB socket read holds hundreds of
+/// newline-framed messages under heavy terminal output, and the per-line tail
+/// copies made this reader the pipeline's bottleneck (backpressure all the way
+/// back to wavesrv's ws write deadline).
+struct LineFrameBuffer {
+    private var buffer = Data()
+    private var readOffset = 0
+
+    mutating func append(_ chunk: Data) {
+        buffer.append(chunk)
+    }
+
+    /// The next complete line (without its trailing `\n`), skipping empty lines,
+    /// or nil when no full line is buffered.
+    mutating func nextLine() -> Data? {
+        while true {
+            let scanStart = buffer.index(buffer.startIndex, offsetBy: readOffset)
+            guard scanStart < buffer.endIndex,
+                  let nl = buffer[scanStart...].firstIndex(of: 0x0a) else {
+                compact()
+                return nil
+            }
+            let line = Data(buffer[scanStart..<nl])
+            readOffset = buffer.distance(from: buffer.startIndex, to: nl) + 1
+            if line.isEmpty { continue }
+            return line
+        }
+    }
+
+    private mutating func compact() {
+        guard readOffset > 0 else { return }
+        buffer.removeSubrange(buffer.startIndex..<buffer.index(buffer.startIndex, offsetBy: readOffset))
+        readOffset = 0
+    }
+}
+
 /// `WSChannel` over a unix domain socket: newline-framed JSON messages, with the
 /// authenticate line sent on connect (replaces the WS upgrade query/header).
 public final class UnixWSChannel: WSChannel, @unchecked Sendable {
     private let conn: UnixStreamConnection
     private let lock = NSLock()
-    private var buffer = Data()
+    private var frames = LineFrameBuffer()
     private var closed = false
 
     public init(path: String, authKey: String, stableId: String) async throws {
@@ -254,12 +292,9 @@ public final class UnixWSChannel: WSChannel, @unchecked Sendable {
     public func receive() async throws -> Data {
         while true {
             lock.lock()
-            if let nl = buffer.firstIndex(of: 0x0a) {
-                let line = buffer[buffer.startIndex..<nl]
-                buffer = Data(buffer[buffer.index(after: nl)...])
+            if let line = frames.nextLine() {
                 lock.unlock()
-                if line.isEmpty { continue }
-                return Data(line)
+                return line
             }
             let isClosed = closed
             lock.unlock()
@@ -271,7 +306,7 @@ public final class UnixWSChannel: WSChannel, @unchecked Sendable {
                 throw WaveError.transport("unix ws: eof")
             }
             lock.lock()
-            buffer.append(chunk)
+            frames.append(chunk)
             lock.unlock()
         }
     }

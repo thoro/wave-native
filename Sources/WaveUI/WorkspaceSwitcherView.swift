@@ -29,6 +29,12 @@ public struct WorkspaceMenuItem: Equatable, Sendable {
     /// A layout snapshot has been saved for this workspace — enables "Reset to Saved
     /// Layout" in the row's right-click menu.
     public let hasSavedLayout: Bool
+    /// THE workspace sort order: every workspace list in the app (switcher
+    /// dropdown, task pane pickers/menus) sorts with this same comparator.
+    public static func nameOrder(_ a: String, _ b: String) -> Bool {
+        return a.localizedCaseInsensitiveCompare(b) == .orderedAscending
+    }
+
     public init(workspaceId: String, name: String, icon: String?, color: String?,
                 isOpen: Bool = false, isCurrent: Bool = false, hasSavedLayout: Bool = false) {
         self.workspaceId = workspaceId
@@ -179,7 +185,7 @@ final class WorkspaceSwitcherView: NSView {
             // The default widget-bar icons (widgets.json): without these the launcher
             // strip would render every button as the generic circle fallback.
             "square-terminal": "terminal.fill", "list-tree": "list.bullet.indent",
-            "browser": "globe",
+            "browser": "globe", "list-check": "checklist",
         ]
         return map[name] ?? defaultIconSymbol
     }

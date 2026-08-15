@@ -96,6 +96,13 @@ public struct BlockEnv: Sendable {
     public let tabId: String
     /// The window id (for UIContext on mutations).
     public let windowId: String
+    /// The workspace this window is bound to (the tasks pane's workspace scope).
+    /// Empty for content-only callers/tests that never navigate.
+    public let workspaceId: String
+    /// Navigate to a mentioned tab/pane: (workspaceId, tabId, blockId or nil for a
+    /// tab-only target). A cross-workspace target focuses/opens that workspace's
+    /// window first (task-pill click in global mode).
+    public let onNavigate: (@Sendable (String, String, String?) -> Void)?
     /// Raised when this block's content view requests a tab split (Cmd-D /
     /// Cmd-Shift-D). Carries (originating blockId, direction "horizontal"|"vertical").
     public let onSplit: (@Sendable (String, String) -> Void)?
@@ -141,6 +148,8 @@ public struct BlockEnv: Sendable {
     public init(
         transport: WaveTransport, store: ObjectStoreProtocol,
         blockRef: ORef, tabId: String, windowId: String,
+        workspaceId: String = "",
+        onNavigate: (@Sendable (String, String, String?) -> Void)? = nil,
         onSplit: (@Sendable (String, String) -> Void)? = nil,
         onMagnify: (@Sendable (String) -> Void)? = nil,
         onClose: (@Sendable (String) -> Void)? = nil,
@@ -160,6 +169,8 @@ public struct BlockEnv: Sendable {
         self.blockRef = blockRef
         self.tabId = tabId
         self.windowId = windowId
+        self.workspaceId = workspaceId
+        self.onNavigate = onNavigate
         self.onSplit = onSplit
         self.onMagnify = onMagnify
         self.onClose = onClose
@@ -206,6 +217,9 @@ public final class DefaultBlockViewProvider: BlockViewProvider {
     public init() {}
 
     public func makeContentView(view: String?, env: BlockEnv) -> NSView {
+        if view == TasksPaneView.viewType {
+            return TasksPaneView(env: env)
+        }
         let v = PlaceholderBlockContentView(view: view, blockRef: env.blockRef)
         return v
     }

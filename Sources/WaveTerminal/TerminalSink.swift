@@ -273,10 +273,24 @@ public final class GhosttySink: TerminalSink, @unchecked Sendable {
         cellHeightPx = UInt32(max(0, height))
     }
 
-    /// OSC 133;A "prompt start" prefix (FinalTerm / iTerm2 semantic prompt marks),
-    /// emitted by shell integration on every prompt render. Prefix-matched so
-    /// parameterized forms (`133;A;k=...`) are caught too.
-    private static let promptStartMarker = Data("\u{1b}]133;A".utf8)
+    /// "Prompt start" prefixes: OSC 133;A (FinalTerm / iTerm2 semantic prompt
+    /// marks) and OSC 16162;A (Wave's own shell integration — the only mark
+    /// wave-launched shells emit, see shellintegration/*.sh precmd hooks).
+    /// Prefix-matched so parameterized forms (`133;A;k=...`) are caught too.
+    private static let promptStartMarkers = [
+        Data("\u{1b}]133;A".utf8),
+        Data("\u{1b}]16162;A".utf8),
+    ]
+
+    /// End index just past the LAST prompt-start mark in `bytes`, or nil.
+    private static func lastPromptMarkEnd(in bytes: Data) -> Data.Index? {
+        var cut: Data.Index?
+        for marker in promptStartMarkers {
+            guard let found = bytes.range(of: marker, options: .backwards)?.upperBound else { continue }
+            if cut == nil || found > cut! { cut = found }
+        }
+        return cut
+    }
 
     /// DEC private modes that make the terminal report INPUT to the pty: mouse
     /// tracking (9/1000/1002/1003) and focus events (1004).
@@ -298,17 +312,20 @@ public final class GhosttySink: TerminalSink, @unchecked Sendable {
         replaying = replay
         if let t = terminal {
             // Self-heal for crashed TUIs: a program that dies without sending its
-            // DECRST cleanup leaves mouse/focus reporting stuck on, and the shell
-            // prompt then receives every pointer move as SGR mouse reports. A
-            // prompt-start mark while reporting is enabled is that exact
-            // contradiction — no shell consumes mouse reports at its own prompt —
-            // so the stuck modes are cleared at the mark. The chunk is split AT the
+            // DECRST cleanup leaves mouse/focus reporting stuck on (the shell
+            // prompt then receives every pointer move as SGR mouse reports) or the
+            // ALT SCREEN stuck active (the scroll wheel then encodes as arrow keys
+            // — DEC 1007 alternate scroll — cycling shell history instead of
+            // moving the viewport). A prompt-start mark while either is enabled is
+            // that exact contradiction — no shell consumes mouse reports or runs
+            // full-screen at its own prompt — so the stuck modes are cleared at
+            // the mark. The chunk is split AT the
             // last mark so bytes after it (e.g. a backfill replay that ends inside
             // a live mouse-enabled TUI) re-enable reporting in order. A mark
             // straddling a chunk boundary is missed; the next prompt heals it.
-            if let cut = bytes.range(of: Self.promptStartMarker, options: .backwards)?.upperBound {
+            if let cut = Self.lastPromptMarkEnd(in: bytes) {
                 Self.vtWrite(t, bytes[bytes.startIndex..<cut])
-                Self.clearStuckReportModes(t)
+                Self.healStuckModes(t)
                 Self.vtWrite(t, bytes[cut...])
             } else {
                 Self.vtWrite(t, bytes)
@@ -349,22 +366,47 @@ public final class GhosttySink: TerminalSink, @unchecked Sendable {
         }
     }
 
-    /// Clear stuck input-report modes (see the prompt-start check in `feed`). A
-    /// no-op when none is set — the common case of a prompt after a well-behaved
-    /// program — so per-chunk cost is a few mode reads only when a mark is present.
-    private static func clearStuckReportModes(_ t: GhosttyTerminal) {
-        var stuck = false
-        for m in inputReportModes {
-            var on = false
-            if ghostty_terminal_mode_get(t, GhosttyMode(m), &on) == GHOSTTY_SUCCESS, on {
-                stuck = true
-                break
+    /// DEC private modes that select the ALTERNATE screen. Exit order matters:
+    /// 1049 first (restores the saved primary cursor), then the clear-on-exit
+    /// variants, which become no-ops once the screen is already primary.
+    private static let altScreenModes: [UInt16] = [1049, 1047, 47]
+
+    private static func modeOn(_ t: GhosttyTerminal, _ mode: UInt16) -> Bool {
+        var on = false
+        return ghostty_terminal_mode_get(t, GhosttyMode(mode), &on) == GHOSTTY_SUCCESS && on
+    }
+
+    /// Clear stuck input-report modes and a stuck alt screen (see the
+    /// prompt-start check in `feed`). A no-op when none is set — the common case
+    /// of a prompt after a well-behaved program — so per-chunk cost is a few
+    /// mode reads only when a mark is present.
+    private static func healStuckModes(_ t: GhosttyTerminal) {
+        if inputReportModes.contains(where: { modeOn(t, $0) }) {
+            for m in inputReportModes + mouseEncodingModes {
+                _ = ghostty_terminal_mode_set(t, GhosttyMode(m), false)
             }
         }
-        guard stuck else { return }
-        for m in inputReportModes + mouseEncodingModes {
-            _ = ghostty_terminal_mode_set(t, GhosttyMode(m), false)
+        guard exitStuckAltScreen(t) else { return }
+        // The same dead TUI owned cursor-keys mode and cursor visibility; a
+        // shell that wants them re-applies via its own bytes after the mark.
+        _ = ghostty_terminal_mode_set(t, GhosttyMode(1), false)
+        if !modeOn(t, 25) { vtWrite(t, Data("\u{1b}[?25h".utf8)) }
+    }
+
+    /// Exit a stuck alternate screen THROUGH the parser. The C mode_set API only
+    /// flips the mode flag — the buffer swap and saved-cursor restore live in the
+    /// stream handler (Terminal.switchScreenMode) — so flag-clearing alone would
+    /// keep rendering the dead TUI's buffer while reporting "primary screen".
+    /// Returns whether an alt-screen mode was stuck.
+    @discardableResult
+    private static func exitStuckAltScreen(_ t: GhosttyTerminal) -> Bool {
+        var seq = ""
+        for m in altScreenModes where modeOn(t, m) {
+            seq += "\u{1b}[?\(m)l"
         }
+        guard !seq.isEmpty else { return false }
+        vtWrite(t, Data(seq.utf8))
+        return true
     }
 
     /// Manual "Reset Terminal" escape hatch: restore the input-side modes a crashed
@@ -377,7 +419,8 @@ public final class GhosttySink: TerminalSink, @unchecked Sendable {
     public func resetStuckModes() {
         lock.lock()
         if let t = terminal {
-            let off: [UInt16] = [1, 6, 47, 1047, 1049, 2048] + Self.inputReportModes + Self.mouseEncodingModes
+            Self.exitStuckAltScreen(t)
+            let off: [UInt16] = [1, 6, 2048] + Self.inputReportModes + Self.mouseEncodingModes
             for m in off { _ = ghostty_terminal_mode_set(t, GhosttyMode(m), false) }
             for m: UInt16 in [7, 25] { _ = ghostty_terminal_mode_set(t, GhosttyMode(m), true) }
         }
