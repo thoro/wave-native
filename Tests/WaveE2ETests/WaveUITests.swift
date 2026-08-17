@@ -387,6 +387,52 @@ final class WaveUITests: XCTestCase {
             LayoutNode(id: "c", data: TabLayoutData(blockId: "C"), size: 10),
         ], flexDirection: .row)
         XCTAssertNotEqual(sig(tree(10, 10), nil), sig(three, nil))
+        // Re-parenting with identical leaf traversal order (drag C below B:
+        // row[A,B,C] -> row[A,col[B,C]]) MUST read as structural — treating it as a
+        // geometry pass leaked the old A|B splitter as a phantom divider.
+        let flat = LayoutNode(id: "r", children: [
+            LayoutNode(id: "a", data: TabLayoutData(blockId: "A"), size: 10),
+            LayoutNode(id: "b", data: TabLayoutData(blockId: "B"), size: 10),
+            LayoutNode(id: "c", data: TabLayoutData(blockId: "C"), size: 10),
+        ], flexDirection: .row)
+        let nested = LayoutNode(id: "r", children: [
+            LayoutNode(id: "a", data: TabLayoutData(blockId: "A"), size: 10),
+            LayoutNode(id: "w", children: [
+                LayoutNode(id: "b", data: TabLayoutData(blockId: "B"), size: 10),
+                LayoutNode(id: "c", data: TabLayoutData(blockId: "C"), size: 10),
+            ], flexDirection: .column, size: 10),
+        ], flexDirection: .row)
+        XCTAssertNotEqual(sig(flat, nil), sig(nested, nil))
+    }
+
+    // Field bug (Wordpress/T1): dragging pane C below B re-parents row[A,B,C] into
+    // row[A,col[B,C]] while keeping the leaf traversal order — the old A|B divider
+    // leaked as a second vertical bar that still resized the left/right panes. After
+    // the re-parent exactly one vertical + one horizontal splitter may remain.
+    func testReparentSweepsStaleSplitter() {
+        let env = BlockEnvFactory(
+            transport: FakeTransport(), store: FakeStore(), tabId: "tab-1", windowId: "w-1")
+        let view = LayoutTreeView(env: env, provider: DefaultBlockViewProvider())
+        view.frame = CGRect(x: 0, y: 0, width: 900, height: 400)
+        func leaf(_ id: String, _ block: String) -> LayoutNode {
+            LayoutNode(id: id, data: TabLayoutData(blockId: block), size: 10)
+        }
+        let flat = LayoutNode(id: "r", children: [
+            leaf("a", "A"), leaf("b", "B"), leaf("c", "C"),
+        ], flexDirection: .row)
+        view.setLayout(root: flat, focusedNodeId: nil, magnifiedNodeId: nil)
+        func splitterCount() -> Int {
+            view.subviews.filter { NSStringFromClass(type(of: $0)).contains("SplitterView") }.count
+        }
+        XCTAssertEqual(splitterCount(), 2)
+
+        let nested = LayoutNode(id: "r", children: [
+            leaf("a", "A"),
+            LayoutNode(id: "w", children: [leaf("b", "B"), leaf("c", "C")],
+                       flexDirection: .column, size: 10),
+        ], flexDirection: .row)
+        view.setLayout(root: nested, focusedNodeId: nil, magnifiedNodeId: nil)
+        XCTAssertEqual(splitterCount(), 2, "the stale A|B splitter must be swept")
     }
 
     // Self-heal: a mounted BlockFrameView that is not tracked in blockViews is

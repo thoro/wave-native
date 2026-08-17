@@ -344,9 +344,14 @@ final class LayoutTreeView: NSView {
         rebuild(structural: structural)
     }
 
-    /// The tree arrangement with sizes excluded: the leaf nodeIds in traversal order plus
-    /// the magnified node. A resize keeps this identical (same panes, same order), so it
-    /// snaps; a split/close/move/magnify changes it, so it animates.
+    /// The tree arrangement with sizes excluded: the nesting of container nodes (id +
+    /// direction) and leaf nodeIds in traversal order, plus the magnified node. A resize
+    /// keeps this identical (same panes, same shape), so it snaps; a split/close/move/
+    /// magnify changes it, so it animates. Container nesting MUST be part of the
+    /// signature: a header-drag that re-parents a pane (row[A,B,C] → row[A,col[B,C]])
+    /// keeps the leaf traversal order identical, and treating that as non-structural
+    /// skipped the stale-splitter sweep — the old A|B divider stayed behind as a second
+    /// draggable bar still resizing the old node pair.
     static func structureSignature(root: LayoutNode?, magnifiedNodeId: String?) -> [String] {
         var ids: [String] = []
         func walk(_ node: LayoutNode) {
@@ -354,7 +359,9 @@ final class LayoutTreeView: NSView {
                 ids.append(node.id)
                 return
             }
+            ids.append("open:\(node.id):\(node.flexDirection.rawValue)")
             for child in node.children ?? [] { walk(child) }
+            ids.append("close")
         }
         if let root { walk(root) }
         ids.append("mag:\(magnifiedNodeId ?? "")")
@@ -658,11 +665,13 @@ final class LayoutTreeView: NSView {
     private func rebuildSplitters(hasMagnified: Bool, structural: Bool) {
         let splitters = hasMagnified ? [] : LayoutTiler.computeSplitters(root: rootNode, in: bounds)
         let liveKeys = Set(splitters.map { $0.key })
-        if structural {
-            for (key, view) in splitterViews where !liveKeys.contains(key) {
-                view.removeFromSuperview()
-                splitterViews.removeValue(forKey: key)
-            }
+        // Sweep stale splitters on EVERY pass, not just structural ones (same self-heal
+        // rationale as the BlockFrameView orphan sweep in rebuild): a boundary that no
+        // longer exists must never keep a live drag target — a leaked one shows up as a
+        // phantom divider that resizes a node pair the tree no longer has.
+        for (key, view) in splitterViews where !liveKeys.contains(key) {
+            view.removeFromSuperview()
+            splitterViews.removeValue(forKey: key)
         }
         for splitter in splitters {
             let view = splitterView(for: splitter)
