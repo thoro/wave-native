@@ -14,7 +14,8 @@
 //   key <name>             up|down|left|right|tab|esc|backspace|home|end
 //   paste <text>           put <text> on the pasteboard, then Cmd-V
 //   click <x> <y>          left click at window point (top-left origin)
-//   drag <x1> <y1> <x2> <y2>  left drag
+//   drag <x1> <y1> <x2> <y2>  left drag (posted through the event queue)
+//   dragd <x1> <y1> <x2> <y2>  left drag, direct-dispatched to the hit view
 //   scroll <dy>            scroll wheel (positive = up)
 //   shot <path>            render the key window to a PNG at <path>
 //
@@ -177,6 +178,23 @@ public final class TestDriver {
         case "drag":
             let p = points(arg, window)
             if p.count >= 2 { postDrag(from: p[0], to: p[1], window) }
+        case "dragd":
+            // Direct-dispatch drag (same path as `click`): exercises view-local
+            // mouseDown/mouseDragged/mouseUp selection without the event queue,
+            // which drops posted gestures in headless/non-key windows.
+            let p = points(arg, window)
+            if p.count >= 2 {
+                mouse(.leftMouseDown, p[0], window)
+                let steps = 8
+                for i in 1...steps {
+                    let t = CGFloat(i) / CGFloat(steps)
+                    let mid = NSPoint(
+                        x: p[0].x + (p[1].x - p[0].x) * t,
+                        y: p[0].y + (p[1].y - p[0].y) * t)
+                    mouse(.leftMouseDragged, mid, window)
+                }
+                mouse(.leftMouseUp, p[1], window)
+            }
         case "scroll":
             scroll(Double(arg) ?? 0, window)
         case "shot":

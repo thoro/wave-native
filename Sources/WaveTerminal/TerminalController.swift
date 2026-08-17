@@ -42,6 +42,10 @@ public enum TerminalCommand {
     public static let setMeta = "setmeta"
     /// Full on-disk scrollback substring search (`wshserver_term.go`).
     public static let searchScrollback = "termsearchscrollback"
+    /// Truncate the block's persisted term buffer (`wshrpctypes.go:184`
+    /// TermClearBufferCommand). The backend publishes the blockfile `truncate`
+    /// event, so the mounted pane clears through its normal subscription.
+    public static let clearBuffer = "termclearbuffer"
 }
 
 /// Where the live sink's coverage of the term file begins, recorded at mount.
@@ -412,6 +416,15 @@ public final class TerminalController: @unchecked Sendable {
     /// sink + reconciler (see `ingestTruncate`), so the screen resets to a fresh pty.
     public func forceRestart() {
         Task { [weak self] in try? await self?.resync(forceRestart: true) }
+    }
+
+    /// Clear the terminal buffer WITHOUT touching the running shell (context-menu
+    /// "Clear"). Truncates the persisted term file server-side; the resulting
+    /// `fileop=truncate` event clears the sink + reconciler (`ingestTruncate`).
+    public func clearBuffer() {
+        Task { [transport, blockId] in
+            try? await transport.callVoid(command: TerminalCommand.clearBuffer, data: blockId)
+        }
     }
 
     // MARK: - Reconnect catch-up (GUARDS §A re-subscribe + §T offset)

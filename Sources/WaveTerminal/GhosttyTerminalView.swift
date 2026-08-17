@@ -3508,7 +3508,7 @@ public final class GhosttyTerminalView: NSView {
     @objc private func menuCopy() { _ = copySelection() }
     @objc private func menuPaste() { _ = pasteFromPasteboard() }
     @objc private func menuSelectAll() { selectAll() }
-    @objc private func menuClear() { controller.forceRestart() }
+    @objc private func menuClear() { controller.clearBuffer() }
     @objc private func menuSplitRight() { onSplit?(controller.blockId, "horizontal") }
     @objc private func menuSplitDown() { onSplit?(controller.blockId, "vertical") }
     @objc private func menuMagnify() { onMagnify?(controller.blockId) }

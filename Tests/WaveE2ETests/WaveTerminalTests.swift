@@ -218,6 +218,20 @@ final class TerminalControllerTests: XCTestCase {
         XCTAssertEqual(ctrl.currentOffset, 5)
     }
 
+    /// Context-menu "Clear" must truncate the buffer (termclearbuffer), NOT
+    /// restart the shell (a forcerestart resync kills the running session).
+    func testClearBufferSendsTruncateNotRestart() async throws {
+        let t = MockTransport()
+        let ctrl = TerminalController(blockId: blockId, tabId: tabId, transport: t, sink: CapturingTerminalSink())
+        ctrl.clearBuffer()
+        for _ in 0..<100 {
+            if t.order.contains(TerminalCommand.clearBuffer) { break }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertTrue(t.order.contains(TerminalCommand.clearBuffer))
+        XCTAssertFalse(t.order.contains("resync"))
+    }
+
     func testMountSubscribesBeforeBackfill() async throws {
         let t = MockTransport()
         t.cannedBackfill = (d(""), termFile(size: 0))
