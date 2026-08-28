@@ -312,6 +312,37 @@ final class WaveLayoutTests: XCTestCase {
         XCTAssertEqual(model.currentState().rootNode?.data?.blockId, "blkY")
     }
 
+    func testBackendSplitActionFocusesNewPane() async throws {
+        // A Cmd-D split queues a backend split action with focused:true. Dropping the
+        // flag left focusedNodeId on the split SOURCE, so a later Cmd-W (which reads
+        // the model's focused node) closed the previously focused pane.
+        let pending: [LayoutActionData] = [
+            LayoutActionData(
+                actiontype: LayoutActionType.insertAtIndex, actionid: "s-0",
+                blockid: "blkA", indexarr: [0], focused: true),
+        ]
+        let ls = LayoutState(oid: "L7", version: 1, pendingbackendactions: pending)
+        let model = LayoutModel(
+            layoutORef: ORef.layout("L7"),
+            transport: StubTransport(), store: StubStore(layout: ls),
+            windowId: "w", tabId: "t")
+        model.persistDebounceMs = 100_000
+
+        try await model.start()
+
+        let split = LayoutState(oid: "L7", version: 2, pendingbackendactions: [
+            LayoutActionData(
+                actiontype: LayoutActionType.splitHorizontal, actionid: "s-1",
+                blockid: "blkB", focused: true, targetblockid: "blkA", position: "after"),
+        ])
+        await model.applyLayoutState(split, isInitialLoad: false)
+
+        let state = model.currentState()
+        XCTAssertEqual(state.leafOrder?.count, 2)
+        let newLeaf = try XCTUnwrap(LayoutTree.findNodeByBlockId(state.rootNode, blockId: "blkB"))
+        XCTAssertEqual(state.focusedNodeId, newLeaf.id, "split with focused:true must focus the NEW pane")
+    }
+
     func testRemoveNodeActionRemovesNodeWithoutDeletingBlock() async throws {
         let pending: [LayoutActionData] = [
             LayoutActionData(

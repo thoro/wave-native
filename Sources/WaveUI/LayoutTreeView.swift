@@ -726,6 +726,13 @@ final class LayoutTreeView: NSView {
                 self.pendingFocusBlockId = nil
                 view.focusContent()
                 self.applyFocusBorder(toBlockId: view.blockRef.oid)
+                // Persist into the layout model too (like focusBlock's tail). Setting
+                // the border first makes syncFocusToResponder's "already focused"
+                // early-return swallow its dispatch, so without this the model kept
+                // the OLD pane and window-level Cmd-W/D/M acted on it.
+                if let nodeId = self.frames.first(where: { $0.blockId == view.blockRef.oid })?.nodeId {
+                    self.onLayoutAction?(.focusNode(nodeId: nodeId))
+                }
             } else if view.nodeId == self.focusedNodeId {
                 view.focusContent()
             }

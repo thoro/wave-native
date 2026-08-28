@@ -286,7 +286,8 @@ public final class LayoutModel: @unchecked Sendable {
             LayoutReducer.apply(
                 .replaceNode(
                     targetNodeId: target.id,
-                    newNode: LayoutTree.newLeaf(blockId: action.blockid, size: size)),
+                    newNode: LayoutTree.newLeaf(blockId: action.blockid, size: size),
+                    focused: action.focused ?? false),
                 to: &state)
 
         case LayoutActionType.splitHorizontal, LayoutActionType.splitVertical:
@@ -294,14 +295,21 @@ public final class LayoutModel: @unchecked Sendable {
                   let target = LayoutTree.findNodeByBlockId(state.rootNode, blockId: targetBlockId),
                   let position = action.position.flatMap(SplitPosition.init(rawValue:))
             else { return }
+            // `focused` must flow through here: a Cmd-D split sends focused:true, and
+            // dropping it left `focusedNodeId` on the split SOURCE while the UI focused
+            // the new pane — a later Cmd-W then closed the previously focused pane.
             let newNode = LayoutTree.newLeaf(blockId: action.blockid, size: size)
             if action.actiontype == LayoutActionType.splitHorizontal {
                 LayoutReducer.apply(
-                    .splitHorizontal(targetNodeId: target.id, newNode: newNode, position: position),
+                    .splitHorizontal(
+                        targetNodeId: target.id, newNode: newNode, position: position,
+                        focused: action.focused ?? false),
                     to: &state)
             } else {
                 LayoutReducer.apply(
-                    .splitVertical(targetNodeId: target.id, newNode: newNode, position: position),
+                    .splitVertical(
+                        targetNodeId: target.id, newNode: newNode, position: position,
+                        focused: action.focused ?? false),
                     to: &state)
             }
 
