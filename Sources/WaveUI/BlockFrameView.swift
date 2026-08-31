@@ -1211,8 +1211,15 @@ final class BlockFrameView: NSView {
                 return
             }
         }
-        super.mouseDown(with: event)
+        // Swallow (no super): AppKit re-routes a mouseDown that bubbles up unhandled
+        // to a view visually BEHIND this one. Panes only overlap while one is
+        // magnified (it floats by zPosition), so a click on the magnified pane's
+        // chrome was re-delivered to a dimmed sibling underneath, whose terminal
+        // then stole focus from the zoomed pane.
     }
+
+    override func mouseDragged(with event: NSEvent) {}
+    override func mouseUp(with event: NSEvent) {}
 
     override var mouseDownCanMoveWindow: Bool { false }
 

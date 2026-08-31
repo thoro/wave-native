@@ -461,6 +461,51 @@ final class WaveUITests: XCTestCase {
             "the tracked pane must survive the sweep")
     }
 
+    // AppKit re-routes a mouseDown that bubbles up unhandled to a view visually
+    // BEHIND the hit view. Panes only overlap while one is magnified (it floats by
+    // zPosition), so a click on the magnified pane's chrome was re-delivered to the
+    // dimmed sibling underneath, whose terminal stole focus from the zoomed pane.
+    // The frame must swallow its unhandled clicks.
+    func testPaneChromeClickDoesNotReachPaneBehind() throws {
+        final class MouseProbeView: NSView {
+            var downCount = 0
+            override func mouseDown(with event: NSEvent) { downCount += 1 }
+        }
+
+        let env = BlockEnvFactory(
+            transport: FakeTransport(), store: FakeStore(), tabId: "tab-1", windowId: "w-1")
+        let window = NSWindow(
+            contentRect: CGRect(x: 0, y: 0, width: 600, height: 400),
+            styleMask: [.borderless], backing: .buffered, defer: false)
+        defer { window.orderOut(nil) }
+        let container = NSView(frame: CGRect(x: 0, y: 0, width: 600, height: 400))
+        window.contentView = container
+
+        let behind = MouseProbeView(frame: container.bounds)
+        container.addSubview(behind)
+        let frameView = BlockFrameView(
+            nodeId: "mag", env: env.makeEnv(blockRef: .block("MAG")),
+            provider: DefaultBlockViewProvider())
+        frameView.frame = CGRect(x: 20, y: 20, width: 560, height: 360)
+        container.addSubview(frameView)
+
+        var focusRequests: [String] = []
+        frameView.onRequestFocus = { focusRequests.append($0) }
+
+        // A body point (away from the header), like a click on the pane's padding.
+        let center = NSPoint(x: frameView.bounds.midX, y: frameView.bounds.midY)
+        let inWindow = frameView.convert(center, to: nil)
+        let event = try XCTUnwrap(NSEvent.mouseEvent(
+            with: .leftMouseDown, location: inWindow, modifierFlags: [],
+            timestamp: 0, windowNumber: window.windowNumber, context: nil,
+            eventNumber: 0, clickCount: 1, pressure: 1))
+        frameView.mouseDown(with: event)
+
+        XCTAssertEqual(focusRequests, ["mag"], "the clicked pane itself must be focused")
+        XCTAssertEqual(behind.downCount, 0,
+                       "the bubbled mouseDown must not be re-routed to the pane behind")
+    }
+
     // GUARDS §L — column split distributes height by weight.
     func testTilerColumnWeights() {
         let root = LayoutNode(id: "r", children: [
