@@ -85,6 +85,7 @@ public final class WindowManager {
     public func start() {
         if let dataHome = config.dataHome, let rec = OpenWindowsRecord.read(dataHome: dataHome) {
             savedFrames = rec.windowframes
+            workspaceFocusStamps = rec.workspacefocus
         }
         openEntry(boundWindowId: nil)
     }
@@ -204,6 +205,65 @@ public final class WindowManager {
     /// still opening; consumed by the matching bind.
     private var pendingReveal: (workspaceId: String, tabId: String, blockId: String?)?
 
+    /// Deep-link entry (`wave-native://<otype>/<oid>`, delivered via the app
+    /// delegate's open-URLs): resolve the target's location through a bound
+    /// window's coordinator, then reveal it.
+    public func openDeepLink(_ url: URL) {
+        guard let link = DeepLink.parse(url) else { return }
+        openDeepLink(link)
+    }
+
+    /// A link arriving before any window has bound (launch-by-URL) is parked and
+    /// replayed on the first bind — the resolve needs a connected transport.
+    func openDeepLink(_ link: DeepLink) {
+        guard let primary = entries.first(where: { $0.workspaceId != nil })?.coordinator else {
+            pendingDeepLink = link
+            return
+        }
+        NSApp.activate(ignoringOtherApps: true)
+        Task { [weak self] in
+            guard let loc = await primary.resolveDeepLink(link), let self else { return }
+            if let tabId = loc.tabId {
+                self.revealWorkspaceTabBlock(
+                    workspaceId: loc.workspaceId, tabId: tabId, blockId: loc.blockId)
+            } else {
+                self.focusOrOpen(workspaceId: loc.workspaceId)
+            }
+        }
+    }
+
+    /// Deep link parked by `openDeepLink` while no window had bound; consumed by
+    /// the first bind (last one wins when several arrive during launch).
+    private var pendingDeepLink: DeepLink?
+
+    // MARK: - Workspace focus recency
+
+    /// workspaceId → last-focus epoch seconds; persisted in the open-windows
+    /// record so the switcher's most-recently-focused order survives a relaunch.
+    private var workspaceFocusStamps: [String: Double] = [:]
+
+    /// Snapshot for the switcher surfaces (dropdown + Cmd-Shift-O), read at open time.
+    var workspaceRecency: [String: Double] { workspaceFocusStamps }
+
+    /// A window came to the front — stamp its workspace as most recently focused.
+    /// Driven by main-window changes (not key: a tab drag bounces KEY to the drag
+    /// flotilla for a few ms, which would churn stamps; main stays put).
+    func noteWorkspaceFocused(_ controller: WaveWindowController) {
+        guard let entry = entries.first(where: { $0.controller === controller }),
+              let wsId = entry.workspaceId else { return }
+        workspaceFocusStamps[wsId] = Date().timeIntervalSince1970
+        scheduleRecordWrite()
+    }
+
+    /// Coalesce record writes (shared with the frame-change path) so focus churn
+    /// or a drag/resize is one file write.
+    private func scheduleRecordWrite() {
+        framesWriteTimer?.invalidate()
+        framesWriteTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: false) { [weak self] _ in
+            Task { @MainActor [weak self] in self?.writeRecord() }
+        }
+    }
+
     private func reveal(in coordinator: AppCoordinator, tabId: String, blockId: String?) {
         if let blockId {
             coordinator.revealBlock(tabId: tabId, blockId: blockId)
@@ -262,6 +322,11 @@ public final class WindowManager {
         openingWindowIds.remove(windowId)
         applySavedFrame(to: entry)
         persistOpenWorkspaces()
+        // The frontmost window went main BEFORE its workspace was known (bind is
+        // async), so its recency stamp couldn't land then — stamp it now.
+        if entry.controller.window?.isMainWindow == true {
+            noteWorkspaceFocused(entry.controller)
+        }
 
         if let reveal = pendingReveal, reveal.workspaceId == workspaceId {
             pendingReveal = nil
@@ -271,6 +336,11 @@ public final class WindowManager {
             DispatchQueue.main.async { [weak self] in
                 self?.reveal(in: coordinator, tabId: reveal.tabId, blockId: reveal.blockId)
             }
+        }
+
+        if let link = pendingDeepLink {
+            pendingDeepLink = nil
+            DispatchQueue.main.async { [weak self] in self?.openDeepLink(link) }
         }
 
         // Restore-on-launch: open one NSWindow per other backend window — ONCE, from
@@ -322,7 +392,9 @@ public final class WindowManager {
         guard let dataHome = config.dataHome else { return }
         let ids = entries.compactMap { $0.workspaceId }
         OpenWindowsRecord.write(
-            OpenWindowsRecord(workspaceids: ids, windowframes: savedFrames), dataHome: dataHome)
+            OpenWindowsRecord(workspaceids: ids, windowframes: savedFrames,
+                              workspacefocus: workspaceFocusStamps),
+            dataHome: dataHome)
     }
 
     /// A window moved or resized — record its frame against its backend window id (best
@@ -337,10 +409,7 @@ public final class WindowManager {
         savedFrames[key] = WindowFrameRecord(
             x: Double(frame.minX), y: Double(frame.minY),
             w: Double(frame.width), h: Double(frame.height))
-        framesWriteTimer?.invalidate()
-        framesWriteTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: false) { [weak self] _ in
-            self?.writeRecord()
-        }
+        scheduleRecordWrite()
     }
 
     /// Restore a bound window's saved frame, clamped onto a visible screen (best effort).

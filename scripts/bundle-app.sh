@@ -131,7 +131,14 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <key>NSSupportsAutomaticTermination</key><false/>
     <key>NSSupportsSuddenTermination</key><false/>
     <key>ATSApplicationFontsPath</key><string>Fonts</string>
-    <key>LSApplicationCategoryType</key><string>public.app-category.developer-tools</string>${LSENV}
+    <key>LSApplicationCategoryType</key><string>public.app-category.developer-tools</string>
+    <key>CFBundleURLTypes</key>
+    <array>
+        <dict>
+            <key>CFBundleURLName</key><string>${APP_BUNDLE_ID}.deeplink</string>
+            <key>CFBundleURLSchemes</key><array><string>wave-native</string></array>
+        </dict>
+    </array>${LSENV}
 </dict>
 </plist>
 PLIST

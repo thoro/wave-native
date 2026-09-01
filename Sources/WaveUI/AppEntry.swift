@@ -35,6 +35,11 @@ public final class WaveAppDelegate: NSObject, NSApplicationDelegate {
     private let forceWavesrvRestart: Bool
     private var instanceServer: AppInstanceServer?
 
+    /// URLs delivered before `applicationDidFinishLaunching` (a launch-by-URL
+    /// hands them over between will/did-finish); replayed once the window
+    /// manager exists.
+    private var pendingOpenURLs: [URL] = []
+
     public init(
         makeSession: @escaping WindowManager.SessionFactory,
         provider: BlockViewProvider = DefaultBlockViewProvider(),
@@ -104,6 +109,8 @@ public final class WaveAppDelegate: NSObject, NSApplicationDelegate {
         }
         manager.start()
         startInstanceServer()
+        for url in pendingOpenURLs { manager.openDeepLink(url) }
+        pendingOpenURLs.removeAll()
         NSApp.activate(ignoringOtherApps: true)
         scheduleSnapshotIfRequested()
         if let sock = ProcessInfo.processInfo.environment["WAVE_NATIVE_TEST_SOCK"], !sock.isEmpty {
@@ -184,6 +191,17 @@ public final class WaveAppDelegate: NSObject, NSApplicationDelegate {
             }
             if env["WAVE_NATIVE_SNAPSHOT_QUIT"] == "1" { NSApp.terminate(nil) }
         }
+    }
+
+    /// Deep links (`wave-native://<otype>/<oid>`) — the scheme is registered by
+    /// the bundle's CFBundleURLTypes (`scripts/bundle-app.sh`); an unbundled dev
+    /// run has no Info.plist and so never receives these.
+    public func application(_ application: NSApplication, open urls: [URL]) {
+        guard let manager = windowManager else {
+            pendingOpenURLs.append(contentsOf: urls)
+            return
+        }
+        for url in urls { manager.openDeepLink(url) }
     }
 
     /// Arm the activation-click pane focus (see `WaveWindow.appActivationClickPending`):

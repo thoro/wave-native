@@ -1587,6 +1587,13 @@ public final class AppCoordinator {
         delegate?.coordinatorNavigateToWorkspace(targetWorkspaceId, tabId: tabId, blockId: blockId)
     }
 
+    /// Resolve a deep link to its containing (workspace, tab, block) location at
+    /// open time — the URL carries only the object id, so a link keeps working
+    /// after the pane or tab moves. Returns nil when the target no longer exists.
+    public func resolveDeepLink(_ link: DeepLink) async -> DeepLinkLocation? {
+        return await DeepLinkResolver(store: store, service: service).resolve(link)
+    }
+
     /// Activate `tabId` and move focus to `blockId` (a desktop-notification click). The
     /// tab switch clears its badge via `activate`.
     public func revealBlock(tabId: String, blockId: String) {

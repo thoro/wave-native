@@ -278,18 +278,24 @@ public struct OpenWindowsRecord: Codable, Sendable, Equatable {
     /// windowId → last-known frame, for best-effort position restore. Decoded leniently
     /// (below) so an older record without this field still loads.
     public var windowframes: [String: WindowFrameRecord]
+    /// workspaceId → last-focus epoch seconds, for the switcher's
+    /// most-recently-focused order. Lenient like `windowframes`.
+    public var workspacefocus: [String: Double]
 
-    public init(workspaceids: [String], windowframes: [String: WindowFrameRecord] = [:]) {
+    public init(workspaceids: [String], windowframes: [String: WindowFrameRecord] = [:],
+                workspacefocus: [String: Double] = [:]) {
         self.workspaceids = workspaceids
         self.windowframes = windowframes
+        self.workspacefocus = workspacefocus
     }
 
-    enum CodingKeys: String, CodingKey { case workspaceids, windowframes }
+    enum CodingKeys: String, CodingKey { case workspaceids, windowframes, workspacefocus }
 
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         workspaceids = (try? c.decode([String].self, forKey: .workspaceids)) ?? []
         windowframes = (try? c.decode([String: WindowFrameRecord].self, forKey: .windowframes)) ?? [:]
+        workspacefocus = (try? c.decode([String: Double].self, forKey: .workspacefocus)) ?? [:]
     }
 
     public static let fileName = "wave-native-open-windows.json"

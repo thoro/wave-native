@@ -24,8 +24,10 @@
 //     `env.onNavigate`); pills whose target was deleted render dimmed/inert with
 //     the label stored at mention time.
 //   • Rows are single-line (truncated with …); a single click marks the task and
-//     slides a detail panel in from the right: full text, pills, and a
-//     searchable workspace picker (works while the task is being edited too).
+//     slides a detail panel in from the right: the full text (editable in
+//     place — Enter saves, Esc reverts — and selectable for copying), pills,
+//     and a workspace pill that pops a reassignment menu (works while the
+//     task is being edited too).
 //   • Checked tasks collapse into a "Done" history section with timestamps.
 //
 // Data flows over the task RPCs (`tasklist`/`taskcreate`/`taskupdate`/`taskdelete`)
@@ -73,6 +75,9 @@ final class TasksPaneView: NSView, NSTextFieldDelegate {
     /// label → link for every mention picked during the current quick-add entry.
     /// At commit, tokens still present in the text become the task's links.
     private var pendingMentions: [String: WaveTaskLink] = [:]
+
+    /// Pasted deep-link URLs whose resolve is in flight (guards double-conversion).
+    private var resolvingLinkURLs: Set<String> = []
     /// label → owning workspace for picked mentions; in global mode the first
     /// surviving mention decides which workspace the task is created in.
     private var pendingMentionWorkspaces: [String: String] = [:]
@@ -167,6 +172,13 @@ final class TasksPaneView: NSView, NSTextFieldDelegate {
         detailPanel.onClose = { [weak self] in self?.closeDetail() }
         detailPanel.onAssignWorkspace = { [weak self] taskId, wsId in
             self?.assignWorkspace(taskId: taskId, wsId: wsId)
+        }
+        detailPanel.onEditText = { [weak self] taskId, text in
+            guard let self else { return }
+            Task { [service = self.service] in
+                try? await service.updateTask(taskId: taskId, text: text)
+                await self.refresh()
+            }
         }
 
         inputBox.addSubview(inputField)
@@ -377,7 +389,7 @@ final class TasksPaneView: NSView, NSTextFieldDelegate {
         row.wantsLayer = true
         row.layer?.cornerRadius = Theme.radiusSmall
         if task.oid == selectedTaskId {
-            row.layer?.backgroundColor = Theme.accent.withAlphaComponent(0.14).cgColor
+            row.layer?.backgroundColor = Theme.hoverBackground.cgColor
         }
 
         let taskId = task.oid
@@ -475,7 +487,7 @@ final class TasksPaneView: NSView, NSTextFieldDelegate {
         }
     }
 
-    /// (id, name) pairs for the detail panel's searchable picker, sorted like
+    /// (id, name) pairs for the detail panel's workspace picker, sorted like
     /// the switcher; duplicate names get numeric suffixes.
     private func workspaceChoices() -> [(id: String, name: String)] {
         let uniqued = Self.makeUniquer()
@@ -668,12 +680,17 @@ final class TasksPaneView: NSView, NSTextFieldDelegate {
 
     private func closeDetail() {
         guard selectedTaskId != nil else { return }
+        detailPanel.endTextEditing()
         selectedTaskId = nil
         rebuildRows()
         setDetailVisible(false)
     }
 
     private func setDetailVisible(_ visible: Bool) {
+        // Callers rebuild the rows right before this; settle them at their real
+        // frames first, otherwise the animated pass below animates every new row
+        // from its initial zero frame (grow-from-bottom-left artifact).
+        layoutSubtreeIfNeeded()
         detailTrailing.constant = visible ? -8 : DetailPanelWidth + 16
         NSAnimationContext.runAnimationGroup { ctx in
             ctx.duration = 0.2
@@ -785,7 +802,92 @@ final class TasksPaneView: NSView, NSTextFieldDelegate {
     // MARK: - Quick add + mentions
 
     func controlTextDidChange(_ obj: Notification) {
+        convertDeepLinksInInput()
         updateDropdown()
+    }
+
+    /// A pasted deep link (`wave-native://block|tab/<id>`, e.g. from a pane's
+    /// "Copy Link") morphs into a regular @mention: resolve its target, register
+    /// the pending mention (+ its workspace, so an unassigned/global task lands
+    /// where the pane lives), and replace the URL text with the `@Label` token.
+    /// Workspace links stay plain text — a task link targets a tab/pane. URLs
+    /// being resolved are tracked so keystrokes during the async resolve don't
+    /// double-convert.
+    private func convertDeepLinksInInput() {
+        guard let (range, link) = Self.firstDeepLink(in: inputField.stringValue) else { return }
+        if case .workspace = link { return }
+        let urlText = String(inputField.stringValue[range])
+        guard resolvingLinkURLs.insert(urlText).inserted else { return }
+        Task { [weak self] in
+            guard let self else { return }
+            defer { self.resolvingLinkURLs.remove(urlText) }
+            guard let candidate = await self.mentionForDeepLink(link) else { return }
+            let text = self.inputField.stringValue
+            guard let r = text.range(of: urlText) else { return }
+            let label = self.uniqueMentionLabel(candidate.label)
+            var mention = candidate.link
+            mention.label = label
+            self.pendingMentions[label] = mention
+            if let ws = candidate.workspaceId {
+                self.pendingMentionWorkspaces[label] = ws
+            }
+            self.inputField.stringValue = text.replacingCharacters(in: r, with: "@" + label + " ")
+            self.inputField.invalidateIntrinsicContentSize()
+            self.dropdown.isHidden = true
+            self.moveEntryCursorToEnd()
+            self.convertDeepLinksInInput()
+        }
+    }
+
+    /// First `wave-native://…` URL in `text` (token runs to whitespace) that
+    /// parses as a deep link, with its range. Pure.
+    static func firstDeepLink(in text: String) -> (range: Range<String.Index>, link: DeepLink)? {
+        var search = text.startIndex..<text.endIndex
+        while let hit = text.range(of: DeepLink.scheme + "://", options: [.caseInsensitive], range: search) {
+            let end = text[hit.lowerBound...].firstIndex(where: { $0.isWhitespace }) ?? text.endIndex
+            let urlText = String(text[hit.lowerBound..<end])
+            if let url = URL(string: urlText), let link = DeepLink.parse(url) {
+                return (hit.lowerBound..<end, link)
+            }
+            search = end..<text.endIndex
+        }
+        return nil
+    }
+
+    /// Resolve a block/tab deep link to a mention candidate: the target's CURRENT
+    /// display label, a tabid-carrying link (pills need the tab to navigate), and
+    /// the owning workspace. Nil once the target no longer exists.
+    private func mentionForDeepLink(_ link: DeepLink) async -> TaskMentionCandidate? {
+        let resolver = DeepLinkResolver(store: store, service: service)
+        guard let loc = await resolver.resolve(link), let tabId = loc.tabId else { return nil }
+        let need = [ORef.tab(tabId), loc.blockId.map { ORef.block($0) }].compactMap { $0 }
+            .filter { store.get($0) == nil }
+        if !need.isEmpty { _ = try? await store.loadMany(need) }
+        guard let tab = store.get(.tab(tabId))?.asTab else { return nil }
+        guard let blockId = loc.blockId else {
+            return TaskMentionCandidate(
+                label: tab.name, isTab: true,
+                link: WaveTaskLink(tabid: tabId, blockid: nil, label: tab.name),
+                workspaceId: loc.workspaceId)
+        }
+        guard let block = store.get(.block(blockId))?.asBlock else { return nil }
+        let label = Self.paneLabel(block: block, tabName: tab.name)
+        return TaskMentionCandidate(
+            label: label, isTab: false,
+            link: WaveTaskLink(tabid: tabId, blockid: blockId, label: label),
+            workspaceId: loc.workspaceId)
+    }
+
+    /// Suffix a pasted link's label until it doesn't collide with a pending
+    /// mention (mirrors `makeUniquer`, but against the live pending map).
+    private func uniqueMentionLabel(_ base: String) -> String {
+        var label = base
+        var n = 1
+        while pendingMentions[label] != nil {
+            n += 1
+            label = "\(base) (\(n))"
+        }
+        return label
     }
 
     func control(_ control: NSControl, textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
@@ -1370,23 +1472,30 @@ final class TaskMentionDropdown: NSView {
     }
 }
 
-/// Slide-over detail for the selected task: full (wrapping) text, its pills,
-/// and a searchable workspace picker that reassigns ("" row = No Workspace).
-final class TaskDetailPanel: NSView, NSSearchFieldDelegate {
+/// Slide-over detail for the selected task: the full task text — editable in
+/// place (Enter saves, Shift+Enter breaks the line, Esc reverts) and selectable
+/// for copying — its pills, and a workspace pill that pops a reassignment menu
+/// ("No Workspace" unassigns), matching the list rows' "Move to Workspace" menu.
+final class TaskDetailPanel: NSView, NSTextFieldDelegate {
     var onClose: (() -> Void)?
     /// (taskId, workspaceId) — workspaceId "" unassigns.
     var onAssignWorkspace: ((String, String) -> Void)?
+    /// (taskId, newText) — an inline text edit was committed (Enter / focus loss).
+    var onEditText: ((String, String) -> Void)?
 
     private var taskId = ""
     private var currentWsId = ""
+    private var taskDone = false
+    private var originalText = ""
     private var workspaces: [(id: String, name: String)] = []
-    /// Row index (tag) → workspace id for the currently rendered, filtered rows.
-    private var rowIds: [String] = []
 
-    private let textLabel = NSTextField(wrappingLabelWithString: "")
+    // GrowingTaskField, not a wrapping label: an EDITABLE field's intrinsic
+    // height is single-line under autolayout, which truncates the task text.
+    private let textField = GrowingTaskField()
     private let pillsContainer = NSStackView()
-    private let searchField = NSSearchField()
-    private let wsListStack = NSStackView()
+    private let wsPickerContainer = NSStackView()
+
+    private var isEditingText: Bool { textField.currentEditor() != nil }
 
     init() {
         super.init(frame: .zero)
@@ -1408,11 +1517,19 @@ final class TaskDetailPanel: NSView, NSSearchFieldDelegate {
         close.contentTintColor = Theme.textSecondary
         close.translatesAutoresizingMaskIntoConstraints = false
 
-        textLabel.isSelectable = false
-        textLabel.maximumNumberOfLines = 12
-        textLabel.cell?.truncatesLastVisibleLine = true
-        textLabel.translatesAutoresizingMaskIntoConstraints = false
-        textLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        textField.isEditable = true
+        textField.isSelectable = true
+        textField.font = Theme.uiFont
+        textField.drawsBackground = false
+        textField.isBordered = false
+        textField.focusRingType = .none
+        textField.lineBreakMode = .byWordWrapping
+        textField.maximumNumberOfLines = 0
+        textField.cell?.wraps = true
+        textField.cell?.isScrollable = false
+        textField.delegate = self
+        textField.translatesAutoresizingMaskIntoConstraints = false
+        textField.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
         pillsContainer.orientation = .vertical
         pillsContainer.alignment = .leading
@@ -1424,32 +1541,16 @@ final class TaskDetailPanel: NSView, NSSearchFieldDelegate {
         wsHeader.textColor = Theme.textSecondary
         wsHeader.translatesAutoresizingMaskIntoConstraints = false
 
-        searchField.placeholderString = "Search workspaces…"
-        searchField.font = Theme.tabLabelFont
-        searchField.delegate = self
-        searchField.translatesAutoresizingMaskIntoConstraints = false
-
-        wsListStack.orientation = .vertical
-        wsListStack.alignment = .leading
-        wsListStack.spacing = 1
-        wsListStack.translatesAutoresizingMaskIntoConstraints = false
-
-        let wsDoc = FlippedDocView()
-        wsDoc.translatesAutoresizingMaskIntoConstraints = false
-        wsDoc.addSubview(wsListStack)
-        let wsScroll = NSScrollView()
-        wsScroll.documentView = wsDoc
-        wsScroll.hasVerticalScroller = true
-        wsScroll.drawsBackground = false
-        wsScroll.translatesAutoresizingMaskIntoConstraints = false
+        wsPickerContainer.orientation = .horizontal
+        wsPickerContainer.alignment = .centerY
+        wsPickerContainer.translatesAutoresizingMaskIntoConstraints = false
 
         addSubview(title)
         addSubview(close)
-        addSubview(textLabel)
+        addSubview(textField)
         addSubview(pillsContainer)
         addSubview(wsHeader)
-        addSubview(searchField)
-        addSubview(wsScroll)
+        addSubview(wsPickerContainer)
 
         NSLayoutConstraint.activate([
             title.topAnchor.constraint(equalTo: topAnchor, constant: 10),
@@ -1457,95 +1558,144 @@ final class TaskDetailPanel: NSView, NSSearchFieldDelegate {
             close.centerYAnchor.constraint(equalTo: title.centerYAnchor),
             close.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
 
-            textLabel.topAnchor.constraint(equalTo: title.bottomAnchor, constant: 8),
-            textLabel.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 12),
-            textLabel.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -12),
+            textField.topAnchor.constraint(equalTo: title.bottomAnchor, constant: 8),
+            textField.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 12),
+            textField.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -12),
 
-            pillsContainer.topAnchor.constraint(equalTo: textLabel.bottomAnchor, constant: 8),
+            pillsContainer.topAnchor.constraint(equalTo: textField.bottomAnchor, constant: 8),
             pillsContainer.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 12),
             pillsContainer.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -12),
 
             wsHeader.topAnchor.constraint(equalTo: pillsContainer.bottomAnchor, constant: 14),
             wsHeader.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 12),
 
-            searchField.topAnchor.constraint(equalTo: wsHeader.bottomAnchor, constant: 6),
-            searchField.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 12),
-            searchField.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -12),
-
-            wsScroll.topAnchor.constraint(equalTo: searchField.bottomAnchor, constant: 6),
-            wsScroll.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 8),
-            wsScroll.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -8),
-            wsScroll.bottomAnchor.constraint(lessThanOrEqualTo: bottomAnchor, constant: -10),
-            wsScroll.heightAnchor.constraint(lessThanOrEqualToConstant: 180),
-
-            wsListStack.topAnchor.constraint(equalTo: wsDoc.topAnchor),
-            wsListStack.leadingAnchor.constraint(equalTo: wsDoc.leadingAnchor),
-            wsListStack.trailingAnchor.constraint(equalTo: wsDoc.trailingAnchor),
-            wsListStack.bottomAnchor.constraint(equalTo: wsDoc.bottomAnchor),
-            wsDoc.widthAnchor.constraint(equalTo: wsScroll.contentView.widthAnchor),
+            wsPickerContainer.topAnchor.constraint(equalTo: wsHeader.bottomAnchor, constant: 6),
+            wsPickerContainer.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 12),
+            wsPickerContainer.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -12),
+            wsPickerContainer.bottomAnchor.constraint(lessThanOrEqualTo: bottomAnchor, constant: -10),
         ])
-        let wsHeight = wsScroll.heightAnchor.constraint(equalTo: wsListStack.heightAnchor)
-        wsHeight.priority = .defaultHigh
-        wsHeight.isActive = true
     }
 
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
     func configure(task: WaveTask, pills: NSView?, workspaces: [(id: String, name: String)]) {
+        if isEditingText, task.oid != taskId {
+            endTextEditing()
+        }
         taskId = task.oid
         currentWsId = task.workspaceid
+        taskDone = task.isDone
         self.workspaces = workspaces
-        textLabel.attributedStringValue = TasksPaneView.taskAttributedText(task.text, done: task.isDone)
+        // A background refetch while the user is typing in the field must not
+        // stomp their in-progress edit.
+        if !isEditingText {
+            originalText = task.text
+            textField.attributedStringValue = TasksPaneView.taskAttributedText(task.text, done: task.isDone)
+        }
         pillsContainer.arrangedSubviews.forEach { $0.removeFromSuperview() }
         if let pills {
             pillsContainer.addArrangedSubview(pills)
         }
-        renderWorkspaceRows()
+        renderWorkspacePicker()
     }
 
-    func controlTextDidChange(_ obj: Notification) {
-        renderWorkspaceRows()
+    /// End (and thereby commit) an in-progress inline edit, e.g. before the
+    /// panel slides out or switches to another task.
+    func endTextEditing() {
+        guard isEditingText else { return }
+        window?.makeFirstResponder(nil)
     }
 
-    private func renderWorkspaceRows() {
-        wsListStack.arrangedSubviews.forEach { $0.removeFromSuperview() }
-        rowIds = []
-        let query = searchField.stringValue.lowercased()
-        var choices: [(id: String, name: String)] = [("", "No Workspace")]
-        choices += workspaces
-        for choice in choices {
-            if !query.isEmpty, !choice.name.lowercased().contains(query) { continue }
-            addWorkspaceRow(id: choice.id, name: choice.name)
+    func control(_ control: NSControl, textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
+        if commandSelector == #selector(NSResponder.insertNewline(_:)) {
+            if NSApp.currentEvent?.modifierFlags.contains(.shift) == true {
+                textView.insertNewlineIgnoringFieldEditor(nil)
+                return true
+            }
+            window?.makeFirstResponder(nil)
+            return true
         }
-        for view in wsListStack.arrangedSubviews {
-            view.widthAnchor.constraint(equalTo: wsListStack.widthAnchor).isActive = true
+        if commandSelector == #selector(NSResponder.cancelOperation(_:)) {
+            textField.attributedStringValue = TasksPaneView.taskAttributedText(originalText, done: taskDone)
+            window?.makeFirstResponder(nil)
+            return true
         }
+        return false
     }
 
-    private func addWorkspaceRow(id: String, name: String) {
-        let isCurrent = id == currentWsId
-        let button = NSButton(title: name, target: self, action: #selector(workspaceRowClicked(_:)))
-        button.isBordered = false
-        button.alignment = .left
-        button.font = Theme.uiFont
-        button.contentTintColor = isCurrent ? Theme.accent : Theme.textPrimary
-        button.image = NSImage(systemSymbolName: isCurrent ? "checkmark.circle.fill" : "circle",
-                               accessibilityDescription: nil)?
-            .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 11, weight: .regular))
-        button.imagePosition = .imageLeading
-        button.tag = rowIds.count
-        button.translatesAutoresizingMaskIntoConstraints = false
-        rowIds.append(id)
-        wsListStack.addArrangedSubview(button)
+    func controlTextDidEndEditing(_ obj: Notification) {
+        commitTextIfChanged()
     }
 
-    @objc private func workspaceRowClicked(_ sender: NSButton) {
-        guard rowIds.indices.contains(sender.tag) else { return }
-        let wsId = rowIds[sender.tag]
-        guard wsId != currentWsId else { return }
+    private func commitTextIfChanged() {
+        let text = textField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        // Empty text is rejected by the backend — treat it like Esc (revert).
+        let changed = !text.isEmpty && text != originalText
+        if changed { originalText = text }
+        textField.attributedStringValue = TasksPaneView.taskAttributedText(originalText, done: taskDone)
+        if changed { onEditText?(taskId, text) }
+    }
+
+    override func layout() {
+        let width = bounds.width - 24
+        if width > 0, textField.preferredMaxLayoutWidth != width {
+            textField.preferredMaxLayoutWidth = width
+            textField.invalidateIntrinsicContentSize()
+        }
+        super.layout()
+    }
+
+    // AppKit re-routes a mouseDown that bubbles up unhandled to the views
+    // visually BEHIND this panel — a click on the flyout's background would
+    // "select" the task row underneath it. Swallow the whole gesture instead;
+    // a background click also ends (commits) an in-progress inline edit.
+    override func mouseDown(with event: NSEvent) {
+        endTextEditing()
+    }
+
+    override func mouseDragged(with event: NSEvent) {}
+    override func mouseUp(with event: NSEvent) {}
+    override func rightMouseDown(with event: NSEvent) {}
+    override func otherMouseDown(with event: NSEvent) {}
+
+    private func renderWorkspacePicker() {
+        wsPickerContainer.arrangedSubviews.forEach { $0.removeFromSuperview() }
+        let name = workspaces.first(where: { $0.id == currentWsId })?.name
+        let pill = TaskPillButton(
+            title: name ?? "No Workspace", symbol: "square.grid.2x2",
+            tint: name == nil ? Theme.textGrey : Theme.textSecondary, dimmed: name == nil)
+        pill.onTap = { [weak self, weak pill] in
+            guard let self, let pill else { return }
+            self.showWorkspaceMenu(from: pill)
+        }
+        wsPickerContainer.addArrangedSubview(pill)
+    }
+
+    private func showWorkspaceMenu(from anchor: NSView) {
+        let menu = NSMenu()
+        for choice in workspaces {
+            let item = NSMenuItem(title: choice.name, action: #selector(workspacePicked(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = choice.id
+            item.state = choice.id == currentWsId ? .on : .off
+            menu.addItem(item)
+        }
+        if !menu.items.isEmpty {
+            menu.addItem(.separator())
+        }
+        let none = NSMenuItem(title: "No Workspace", action: #selector(workspacePicked(_:)), keyEquivalent: "")
+        none.target = self
+        none.representedObject = ""
+        none.state = currentWsId.isEmpty ? .on : .off
+        menu.addItem(none)
+        menu.popUp(positioning: nil, at: NSPoint(x: 0, y: anchor.bounds.height + 4), in: anchor)
+    }
+
+    @objc private func workspacePicked(_ sender: NSMenuItem) {
+        guard let wsId = sender.representedObject as? String, wsId != currentWsId else { return }
         currentWsId = wsId
-        renderWorkspaceRows()
+        renderWorkspacePicker()
         onAssignWorkspace?(taskId, wsId)
     }
 

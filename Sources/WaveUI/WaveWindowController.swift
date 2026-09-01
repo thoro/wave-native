@@ -135,6 +135,9 @@ public final class WaveWindowController: NSWindowController, AppCoordinatorDeleg
         tabBar.onCloseTab = { [weak self] id in self?.coordinator.closeTab(id) }
         tabBar.onNewTab = { [weak self] in self?.coordinator.newTab() }
         tabBar.onSelectWorkspace = { [weak self] id in self?.navigateToWorkspace(id) }
+        tabBar.workspaceSwitcher.recencyProvider = { [weak self] in
+            self?.windowManager?.workspaceRecency ?? [:]
+        }
         tabBar.onCreateWorkspace = { [weak self] name in self?.createWorkspace(named: name) }
         tabBar.onRenameWorkspace = { [weak self] id, name in self?.coordinator.renameWorkspace(id, name: name) }
         tabBar.onSetWorkspaceColor = { [weak self] id, hex in self?.coordinator.setWorkspaceColor(id: id, color: hex) }
@@ -496,7 +499,8 @@ public final class WaveWindowController: NSWindowController, AppCoordinatorDeleg
     /// "+ Create workspace" action. Selecting a workspace reuses the existing chrome
     /// path `AppCoordinator.switchWorkspace(_:)`; the action calls `createWorkspace`.
     private func showWorkspaceSwitcher() {
-        var items = workspaceItems.map {
+        let stamps = windowManager?.workspaceRecency ?? [:]
+        var items = WorkspaceMenuItem.recencyOrder(workspaceItems, stamps: stamps).map {
             QuickOpenItem(id: $0.workspaceId, title: $0.name, icon: $0.icon, color: $0.color)
         }
         items.append(QuickOpenItem(id: Self.createWorkspaceItemId, title: "+  Create workspace"))
@@ -820,6 +824,7 @@ public final class WaveWindowController: NSWindowController, AppCoordinatorDeleg
     /// at drag start/drop, which flickered a key-gated border; main stays put.
     public func windowDidBecomeMain(_ notification: Notification) {
         activeLayoutView?.setWindowActive(true)
+        windowManager?.noteWorkspaceFocused(self)
     }
 
     public func windowDidResignMain(_ notification: Notification) {

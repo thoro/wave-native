@@ -31,8 +31,24 @@ public struct WorkspaceMenuItem: Equatable, Sendable {
     public let hasSavedLayout: Bool
     /// THE workspace sort order: every workspace list in the app (switcher
     /// dropdown, task pane pickers/menus) sorts with this same comparator.
+    /// The SWITCHER surfaces (dropdown, Cmd-Shift-O) layer `recencyOrder` on
+    /// top at display time; index-keyed lists (the Workspace menu's Cmd-Ctrl-1..9)
+    /// stay on pure name order so their shortcuts don't re-map.
     public static func nameOrder(_ a: String, _ b: String) -> Bool {
         return a.localizedCaseInsensitiveCompare(b) == .orderedAscending
+    }
+
+    /// Most-recently-focused first (`stamps`: workspaceId → last-focus epoch
+    /// seconds); never-focused workspaces follow in name order. Pure.
+    public static func recencyOrder(
+        _ items: [WorkspaceMenuItem], stamps: [String: Double]
+    ) -> [WorkspaceMenuItem] {
+        return items.sorted {
+            let a = stamps[$0.workspaceId] ?? 0
+            let b = stamps[$1.workspaceId] ?? 0
+            if a != b { return a > b }
+            return nameOrder($0.name, $1.name)
+        }
     }
 
     public init(workspaceId: String, name: String, icon: String?, color: String?,
@@ -66,6 +82,9 @@ final class WorkspaceSwitcherView: NSView {
     var onSaveWorkspaceLayout: ((String) -> Void)?
     /// Row right-click "Reset to Saved Layout": rebuild this workspace to its snapshot. Carries the workspaceId.
     var onResetWorkspaceLayout: ((String) -> Void)?
+    /// Live workspaceId → last-focus stamps (WindowManager). Read at dropdown-open
+    /// time so the rows sort most-recently-focused first with zero refresh plumbing.
+    var recencyProvider: (() -> [String: Double])?
 
     private let button = NonDragView()
     private let iconView = NSImageView()
@@ -201,8 +220,13 @@ final class WorkspaceSwitcherView: NSView {
     func setItems(_ items: [WorkspaceMenuItem]) {
         self.items = items
         if let dropdown, dropdown.isShown {
-            dropdown.controller.setItems(items, active: activeWorkspaceId)
+            dropdown.controller.setItems(displayOrdered(items), active: activeWorkspaceId)
         }
+    }
+
+    private func displayOrdered(_ items: [WorkspaceMenuItem]) -> [WorkspaceMenuItem] {
+        guard let stamps = recencyProvider?(), !stamps.isEmpty else { return items }
+        return WorkspaceMenuItem.recencyOrder(items, stamps: stamps)
     }
 
     override func mouseDown(with event: NSEvent) {
@@ -253,7 +277,7 @@ final class WorkspaceSwitcherView: NSView {
         let controller = WorkspaceMenuController()
         controller.palette = (paletteColors, paletteIcons)
         controller.activeIsSaved = activeIsSaved
-        controller.setItems(items, active: activeWorkspaceId)
+        controller.setItems(displayOrdered(items), active: activeWorkspaceId)
         controller.onSelect = { [weak self] id in
             self?.dropdown?.close()
             self?.onSelectWorkspace?(id)
@@ -343,6 +367,10 @@ final class WorkspaceMenuController: NSViewController, NSTextFieldDelegate {
 
     private var items: [WorkspaceMenuItem] = []
     private var activeId: String?
+    /// The active workspace's row from the last rebuild, so the popover can
+    /// scroll it into view on open — a list taller than the panel used to open
+    /// pinned to the top with the checkmarked row off-screen.
+    private weak var activeRow: NSView?
     /// The workspace whose inline editor is currently expanded (nil = none).
     private var editingId: String?
     /// The editing row's inline name field (replaces the row label while editing); kept
@@ -482,8 +510,11 @@ final class WorkspaceMenuController: NSViewController, NSTextFieldDelegate {
         guard isViewLoaded else { return }
         stack.arrangedSubviews.forEach { $0.removeFromSuperview() }
         footerStack.arrangedSubviews.forEach { $0.removeFromSuperview() }
+        activeRow = nil
         for item in items {
-            addArranged(makeWorkspaceRow(item), to: stack)
+            let row = makeWorkspaceRow(item)
+            addArranged(row, to: stack)
+            if item.workspaceId == activeId { activeRow = row }
             if editingId == item.workspaceId {
                 addArranged(makeEditor(for: item), to: stack)
             }
@@ -496,6 +527,16 @@ final class WorkspaceMenuController: NSViewController, NSTextFieldDelegate {
             addArranged(makeActionRow(title: "Save workspace") { [weak self] in self?.onSave?(activeId) }, to: footerStack)
         }
         updatePreferredSize()
+    }
+
+    /// Scroll the list so the CURRENT workspace's row is visible (with a row of
+    /// context above/below). Called by the popover once the panel has laid out;
+    /// NOT re-run on live `setItems` updates, so it never yanks a scroll the
+    /// user made while the dropdown is open.
+    func scrollToActiveRow() {
+        guard isViewLoaded, let row = activeRow else { return }
+        view.layoutSubtreeIfNeeded()
+        row.scrollToVisible(row.bounds.insetBy(dx: 0, dy: -32))
     }
 
     /// Expand the footer composer. No workspace exists yet at this point — creation is
@@ -982,6 +1023,7 @@ final class LeftArrowPopover {
         anchorWindow.addChildWindow(panel, ordered: .above)
         panel.orderFront(nil)
         self.panel = panel
+        controller.scrollToActiveRow()
 
         // Resize (keeping the arrow/top pinned) when the inline editor expands/collapses.
         controller.onContentSizeChange = { [weak self] size in self?.resize(contentHeight: size.height) }

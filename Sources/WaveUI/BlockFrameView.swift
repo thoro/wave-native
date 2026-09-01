@@ -143,7 +143,7 @@ final class BlockFrameView: NSView {
         case forceRestart, termClearBuffer, resetTerminal, clearOnRestart, runOnStartup, debugConnection
         case reload, copyURL, openExternal, setBlockHomepage
         case hideNav, unhideNav, userAgentType, zoom
-        case renamePane, copyBlockId, close
+        case renamePane, copyBlockId, copyLink, close
     }
 
     /// The ordered menu-item ids for a block, by view type + chrome state. Structure
@@ -164,6 +164,7 @@ final class BlockFrameView: NSView {
         items.append(.separator)
         items.append(.renamePane)
         items.append(.copyBlockId)
+        items.append(.copyLink)
         items.append(.separator)
         items.append(.close)
         return items
@@ -856,6 +857,7 @@ final class BlockFrameView: NSView {
             case .zoom: menu.addItem(makeZoomItem(meta: meta))
             case .renamePane: menu.addItem(menuItem("Rename Pane", #selector(menuRenamePane)))
             case .copyBlockId: menu.addItem(menuItem("Copy BlockId", #selector(menuCopyBlockId)))
+            case .copyLink: menu.addItem(menuItem("Copy Link", #selector(menuCopyLink)))
             case .close: menu.addItem(menuItem("Close Block", #selector(menuCloseBlock)))
             }
         }
@@ -977,6 +979,7 @@ final class BlockFrameView: NSView {
     @objc private func menuSplitDown() { env.onSplit?(blockRef.oid, "vertical") }
     @objc private func menuCloseBlock() { env.onClose?(blockRef.oid) }
     @objc private func menuCopyBlockId() { copyToClipboard(blockRef.oid) }
+    @objc private func menuCopyLink() { copyToClipboard(DeepLink.block(blockRef.oid).urlString) }
     @objc private func menuRenamePane() { beginRenamePane() }
 
     // MARK: Rename Pane (inline editor over the title region)
