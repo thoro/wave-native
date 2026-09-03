@@ -130,15 +130,8 @@ public final class TestDriver {
             // superview chain at the point, so blind coordinate clicking can be
             // debugged instead of guessed at.
             let parts = arg.split(separator: " ")
-            guard parts.count >= 3, let content = window.contentView else { return }
-            let p = points(parts[0] + " " + parts[1], window)
-            guard let loc = p.first else { return }
-            var chain: [String] = []
-            var v: NSView? = content.hitTest(hitPoint(loc, content))
-            while let cur = v {
-                chain.append("\(type(of: cur)) frame=\(cur.frame)")
-                v = cur.superview
-            }
+            guard parts.count >= 3, let x = Double(parts[0]), let y = Double(parts[1]) else { return }
+            let chain = ViewDump.hitChain(in: window, contentPoint: NSPoint(x: x, y: y))
             try? chain.joined(separator: "\n").write(
                 toFile: String(parts[2]), atomically: true, encoding: .utf8)
         case "perfclick":

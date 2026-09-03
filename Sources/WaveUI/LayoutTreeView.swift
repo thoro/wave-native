@@ -900,7 +900,21 @@ final class LayoutTreeView: NSView {
     /// by a subview re-insert), but AppKit hit-tests in subview order, not zPosition — a
     /// dimmed sibling behind the magnified pane could otherwise steal the click. Route
     /// clicks within the magnified pane to it explicitly.
+    ///
+    /// Outside the magnified frame (the 5% margin, where the dimmed siblings show
+    /// through) the tree claims the hit itself: the siblings are display-only while a
+    /// pane is magnified, and a click landing on one focused it "behind" the zoomed
+    /// pane. The tree swallows those presses below so AppKit cannot re-route the
+    /// unhandled event to a view behind it.
     override func hitTest(_ point: NSPoint) -> NSView? {
+        // The superview calls hitTest on EVERY subview, hidden or not — it is the
+        // default implementation that returns nil for a hidden view, and this override
+        // replaces it. Without the guard a HIDDEN tab's tree with a magnified pane
+        // captured every click inside the 95% magnify frame of the tab actually on
+        // screen (whenever it sat above that tab in subview order): weeks of
+        // "selection only works at the edges" / "clicking focuses an invisible pane"
+        // that survived restarts because the magnify state is persisted.
+        guard !isHiddenOrHasHiddenAncestor else { return nil }
         if let magId = magnifiedNodeId,
            let magBlockId = frames.first(where: { $0.nodeId == magId })?.blockId,
            let magView = blockViews[magBlockId] {
@@ -908,9 +922,16 @@ final class LayoutTreeView: NSView {
             if magView.frame.contains(local) {
                 return magView.hitTest(local) ?? magView
             }
+            return bounds.contains(local) ? self : nil
         }
         return super.hitTest(point)
     }
+
+    override func mouseDown(with event: NSEvent) {}
+    override func mouseDragged(with event: NSEvent) {}
+    override func mouseUp(with event: NSEvent) {}
+    override func rightMouseDown(with event: NSEvent) {}
+    override func otherMouseDown(with event: NSEvent) {}
 
     /// Pane focus follows keyboard focus. Some focus routes never pass through this
     /// view's own click paths: a WKWebView claims the firstResponder itself on a click
@@ -1289,5 +1310,32 @@ public struct BlockEnvFactory: Sendable {
             onPickConnection: onPickConnection, onOpenWebURL: onOpenWebURL, onRequestFocus: onRequestFocus,
             onBell: onBell, onNotification: onNotification, onClipboardCopy: onClipboardCopy,
             connections: connections, termThemes: termThemes, defaultTermThemeName: defaultTermThemeName)
+    }
+}
+
+extension LayoutTreeView: ViewDumpAnnotating {
+    /// The bookkeeping hit-testing depends on but cannot see: which pane views are
+    /// tracked (an untracked one is an orphan), the magnify/focus ids, and the
+    /// in-flight animation sets — a stale entry there freezes geometry passes.
+    var dumpAnnotation: String {
+        let tracked = blockViews.map { "\($0.key.suffix(8))@\($0.value.nodeId.suffix(8))" }.sorted()
+        var parts = [
+            "tab=\(tabId)",
+            "leaves=\(frames.count)",
+            "tracked=[\(tracked.joined(separator: ","))]",
+            "splitters=\(splitterViews.count)",
+            "focused=\(focusedNodeId ?? "nil")",
+            "magnified=\(magnifiedNodeId ?? "nil")",
+        ]
+        if !animatingBlockIds.isEmpty { parts.append("ANIMATING=\(animatingBlockIds.sorted())") }
+        if !zDemoteOnCompletion.isEmpty { parts.append("zDemotePending=\(zDemoteOnCompletion.sorted())") }
+        return parts.joined(separator: " ")
+    }
+}
+
+extension SplitterView: ViewDumpAnnotating {
+    var dumpAnnotation: String {
+        guard let splitter else { return "splitter=NONE" }
+        return "splitter=\(splitter.key) \(splitter.horizontal ? "h" : "v")"
     }
 }

@@ -135,6 +135,16 @@ public final class WaveAppDelegate: NSObject, NSApplicationDelegate {
                     }
                 }
             }
+            if op == AppInstanceOp.dumpViews || op.hasPrefix(AppInstanceOp.dumpViews + " ") {
+                let args = op.dropFirst(AppInstanceOp.dumpViews.count)
+                    .split(separator: " ").map(String.init)
+                return DispatchQueue.main.sync {
+                    MainActor.assumeIsolated {
+                        retainedAppDelegate?.dumpViews(args: args, dataHome: dataHome)
+                            ?? AppInstanceOp.errorPrefix + "app not ready"
+                    }
+                }
+            }
             DispatchQueue.main.async {
                 MainActor.assumeIsolated {
                     retainedAppDelegate?.handleInstanceOp(op)
@@ -144,6 +154,32 @@ public final class WaveAppDelegate: NSObject, NSApplicationDelegate {
         }
         instanceServer = server
         server.start()
+    }
+
+    /// `DUMPVIEWS [path] [x y]` (see `AppInstanceOp.dumpViews`): write the live view
+    /// hierarchy of every window — plus the hit chain at (x, y) in the key window when
+    /// given — and reply with the file written. A trailing numeric pair is the point;
+    /// anything before it is the output path.
+    private func dumpViews(args: [String], dataHome: String) -> String {
+        var path = (dataHome as NSString).appendingPathComponent("wave-native-viewdump.txt")
+        var point: NSPoint?
+        var rest = args
+        if rest.count >= 2, let x = Double(rest[rest.count - 2]), let y = Double(rest[rest.count - 1]) {
+            point = NSPoint(x: x, y: y)
+            rest.removeLast(2)
+        }
+        if let given = rest.first, !given.isEmpty { path = given }
+        // Prefer the key window; fall back like the test driver so a dump still works
+        // while the app is inactive (often exactly the situation being debugged).
+        let target = NSApp.keyWindow ?? NSApp.windows.first(where: { $0.isVisible && $0.contentView != nil })
+        let hit = point.flatMap { p in target.map { (window: $0, contentPoint: p) } }
+        let report = ViewDump.report(windows: NSApp.windows, hit: hit)
+        do {
+            try report.write(toFile: path, atomically: true, encoding: .utf8)
+        } catch {
+            return AppInstanceOp.errorPrefix + "write \(path): \(error.localizedDescription)"
+        }
+        return AppInstanceOp.dumpPrefix + path
     }
 
     /// Handle a control-socket op from a later launch.

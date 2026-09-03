@@ -461,6 +461,125 @@ final class WaveUITests: XCTestCase {
             "the tracked pane must survive the sweep")
     }
 
+    // While a pane is magnified, its dimmed siblings still show through the 5% margin
+    // around it. A click there must not reach a sibling (it focused the pane "behind"
+    // the zoomed one): the tree claims the margin hit itself and swallows the press,
+    // so AppKit cannot re-route the unhandled event to a view behind the tree either.
+    func testMarginClickWhileMagnifiedDoesNotReachDimmedSibling() throws {
+        final class MouseProbeView: NSView {
+            var downCount = 0
+            override func mouseDown(with event: NSEvent) { downCount += 1 }
+        }
+
+        let env = BlockEnvFactory(
+            transport: FakeTransport(), store: FakeStore(), tabId: "tab-1", windowId: "w-1")
+        let window = NSWindow(
+            contentRect: CGRect(x: 0, y: 0, width: 900, height: 400),
+            styleMask: [.borderless], backing: .buffered, defer: false)
+        defer { window.orderOut(nil) }
+        let container = NSView(frame: CGRect(x: 0, y: 0, width: 900, height: 400))
+        window.contentView = container
+        let behind = MouseProbeView(frame: container.bounds)
+        container.addSubview(behind)
+
+        let view = LayoutTreeView(env: env, provider: DefaultBlockViewProvider())
+        view.frame = container.bounds
+        container.addSubview(view)
+        func leaf(_ id: String, _ block: String) -> LayoutNode {
+            LayoutNode(id: id, data: TabLayoutData(blockId: block), size: 10)
+        }
+        let root = LayoutNode(id: "r", children: [leaf("a", "A"), leaf("b", "B")], flexDirection: .row)
+        view.setLayout(root: root, focusedNodeId: "b", magnifiedNodeId: "b")
+
+        let panes = view.subviews.compactMap { $0 as? BlockFrameView }
+        let magnified = try XCTUnwrap(panes.first { $0.nodeId == "b" })
+        let sibling = try XCTUnwrap(panes.first { $0.nodeId == "a" })
+        // Left margin: outside the centered 95% frame, over the dimmed left sibling.
+        let margin = NSPoint(x: magnified.frame.minX / 2, y: view.bounds.midY)
+        XCTAssertTrue(sibling.frame.contains(margin), "fixture: the margin point must be over the sibling")
+        XCTAssertFalse(magnified.frame.contains(margin))
+
+        let hit = view.hitTest(view.convert(margin, to: container))
+        XCTAssertTrue(hit === view, "margin hit must be claimed by the tree, got \(String(describing: hit))")
+        XCTAssertFalse(hit?.isDescendant(of: sibling) ?? false)
+
+        let inside = NSPoint(x: magnified.frame.midX, y: magnified.frame.midY)
+        let insideHit = try XCTUnwrap(view.hitTest(view.convert(inside, to: container)))
+        XCTAssertTrue(insideHit.isDescendant(of: magnified), "clicks inside still reach the magnified pane")
+
+        let event = try XCTUnwrap(NSEvent.mouseEvent(
+            with: .leftMouseDown, location: view.convert(margin, to: nil), modifierFlags: [],
+            timestamp: 0, windowNumber: window.windowNumber, context: nil,
+            eventNumber: 0, clickCount: 1, pressure: 1))
+        view.mouseDown(with: event)
+        XCTAssertEqual(behind.downCount, 0, "the swallowed margin press must not be re-routed behind the tree")
+    }
+
+    // A tab switch only flips `isHidden` on the per-tab trees, which stay mounted and
+    // stacked. The magnify hit-test override must honor hidden like the default
+    // implementation does, or a hidden tab's zoomed pane captures the visible tab's
+    // clicks inside the magnify frame (the field "dead zone" that survived restarts).
+    func testHiddenTreeWithMagnifiedPaneDoesNotCaptureClicksOfVisibleTree() {
+        let env = BlockEnvFactory(
+            transport: FakeTransport(), store: FakeStore(), tabId: "tab-1", windowId: "w-1")
+        let provider = DefaultBlockViewProvider()
+        let window = NSWindow(
+            contentRect: CGRect(x: 0, y: 0, width: 600, height: 400),
+            styleMask: [.borderless], backing: .buffered, defer: false)
+        defer { window.orderOut(nil) }
+        let container = NSView(frame: CGRect(x: 0, y: 0, width: 600, height: 400))
+        window.contentView = container
+
+        let visible = LayoutTreeView(env: env, provider: provider)
+        visible.frame = container.bounds
+        container.addSubview(visible)
+        visible.setLayout(
+            root: LayoutNode(id: "v", data: TabLayoutData(blockId: "V"), size: 10),
+            focusedNodeId: "v", magnifiedNodeId: nil)
+
+        // The newer tab's tree is stacked ABOVE and hidden, with a magnified pane.
+        let hidden = LayoutTreeView(env: env, provider: provider)
+        hidden.frame = container.bounds
+        container.addSubview(hidden)
+        hidden.setLayout(
+            root: LayoutNode(id: "row", children: [
+                LayoutNode(id: "h1", data: TabLayoutData(blockId: "H1"), size: 10),
+                LayoutNode(id: "h2", data: TabLayoutData(blockId: "H2"), size: 10),
+            ], flexDirection: .row),
+            focusedNodeId: "h1", magnifiedNodeId: "h1")
+        hidden.isHidden = true
+
+        // Center of the magnify frame, a pane tile, a header, and the splitter gap.
+        let probes = [NSPoint(x: 300, y: 200), NSPoint(x: 100, y: 100),
+                      NSPoint(x: 450, y: 390), NSPoint(x: 300, y: 50)]
+        for p in probes {
+            let inSuper = container.convert(p, to: container.superview)
+            XCTAssertNil(hidden.hitTest(inSuper), "a hidden tree must never hit-test at \(p)")
+            let hit = container.hitTest(inSuper)
+            XCTAssertNotNil(hit, "at \(p)")
+            XCTAssertTrue(hit?.isDescendant(of: visible) ?? false,
+                          "click at \(p) must reach the visible tab, got \(String(describing: hit))")
+        }
+
+        // Same guarantee without magnify (the default-path branch), and when only an
+        // ANCESTOR is hidden (a content area swapped out from under the tree).
+        hidden.setLayout(
+            root: LayoutNode(id: "h1", data: TabLayoutData(blockId: "H1"), size: 10),
+            focusedNodeId: "h1", magnifiedNodeId: nil)
+        let center = container.convert(NSPoint(x: 300, y: 200), to: container.superview)
+        XCTAssertNil(hidden.hitTest(center))
+        XCTAssertTrue(container.hitTest(center)?.isDescendant(of: visible) ?? false)
+
+        hidden.isHidden = false
+        let wrapper = NSView(frame: container.bounds)
+        wrapper.isHidden = true
+        container.addSubview(wrapper)
+        hidden.removeFromSuperview()
+        wrapper.addSubview(hidden)
+        XCTAssertNil(hidden.hitTest(NSPoint(x: 300, y: 200)), "hidden ancestor must also block")
+        XCTAssertTrue(container.hitTest(center)?.isDescendant(of: visible) ?? false)
+    }
+
     // AppKit re-routes a mouseDown that bubbles up unhandled to a view visually
     // BEHIND the hit view. Panes only overlap while one is magnified (it floats by
     // zPosition), so a click on the magnified pane's chrome was re-delivered to the

@@ -90,6 +90,19 @@ final class AppSingleInstanceTests: XCTestCase {
         XCTAssertEqual(received.get(), AppInstanceOp.shutdownForUpgrade)
     }
 
+    func testQueryReturnsTheReplyLineForAnOpWithArguments() {
+        let server = AppInstanceServer(dataHome: dataHome, version: "v1") { op in "ECHO " + op }
+        server.start()
+        defer { server.stop() }
+        waitForSocket()
+        let op = AppInstanceOp.dumpViews + " /tmp/dump.txt 640 400"
+        XCTAssertEqual(AppInstanceClient.query(dataHome: dataHome, line: op), "ECHO " + op)
+    }
+
+    func testQueryReturnsNilWithNoPrimary() {
+        XCTAssertNil(AppInstanceClient.query(dataHome: dataHome, line: AppInstanceOp.keyTab))
+    }
+
     func testNegotiateFailsWithNoPrimary() {
         // No server listening: the secondary cannot connect.
         XCTAssertEqual(AppInstanceClient.negotiate(dataHome: dataHome, myVersion: "v1"), .failed)

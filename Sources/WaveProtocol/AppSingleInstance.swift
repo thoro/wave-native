@@ -48,6 +48,17 @@ public enum AppInstanceOp {
     public static let tabPrefix = "TAB "
     /// Prefix the primary writes on accept: `VERSION <version>`.
     public static let versionPrefix = "VERSION "
+    /// Diagnostics query: `DUMPVIEWS [path] [x y]` writes every window's live view
+    /// hierarchy (and the hit-test chain at content point x,y — top-left origin — in
+    /// the key window) to `path` (default `<dataHome>/wave-native-viewdump.txt`).
+    /// Reply: `DUMP <path>` or `ERR <reason>`. Exists so an invisible click-swallowing
+    /// view can be inspected in the RUNNING app, without a relaunch that would
+    /// destroy the state.
+    public static let dumpViews = "DUMPVIEWS"
+    /// Reply prefix for a successful `dumpViews`.
+    public static let dumpPrefix = "DUMP "
+    /// Reply prefix for a failed query op.
+    public static let errorPrefix = "ERR "
 }
 
 /// A `flock`-based advisory lock over `<dataHome>/wave-native-app.lock`, held for the
@@ -140,6 +151,34 @@ public enum AppInstanceClient {
         let op = (primaryVersion == myVersion) ? AppInstanceOp.openWindow : AppInstanceOp.shutdownForUpgrade
         guard writeLine(fd: fd, op) else { return .failed }
         return (op == AppInstanceOp.openWindow) ? .openedWindow : .requestedTakeover
+    }
+
+    /// Send one arbitrary op line to the running primary and return its single reply
+    /// line (nil when the primary is unreachable, the hello is malformed, or the op has
+    /// no reply). The generic form of `negotiate` for query ops such as `KEYTAB` and
+    /// `DUMPVIEWS`; the test suite and scripts use it in place of `nc`.
+    public static func query(dataHome: String, line: String) -> String? {
+        let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+        guard fd >= 0 else { return nil }
+        defer { close(fd) }
+        setNoSigpipe(fd)
+
+        var addr = sockaddr_un()
+        addr.sun_family = sa_family_t(AF_UNIX)
+        let path = socketPath(dataHome: dataHome)
+        path.withCString { src in
+            withUnsafeMutableBytes(of: &addr.sun_path) { dst in
+                dst.copyMemory(from: UnsafeRawBufferPointer(start: src, count: min(strlen(src) + 1, 104)))
+            }
+        }
+        let len = socklen_t(MemoryLayout<sockaddr_un>.size)
+        let connected = withUnsafePointer(to: &addr) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { connect(fd, $0, len) }
+        }
+        guard connected == 0 else { return nil }
+        guard let hello = readLine(fd: fd), hello.hasPrefix(AppInstanceOp.versionPrefix) else { return nil }
+        guard writeLine(fd: fd, line) else { return nil }
+        return readLine(fd: fd)
     }
 
     private static func readLine(fd: Int32) -> String? {

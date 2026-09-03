@@ -1593,3 +1593,10 @@ final class RenamePaneField: NSTextField, NSTextFieldDelegate {
         action(self)
     }
 }
+
+extension BlockFrameView: ViewDumpAnnotating {
+    var dumpAnnotation: String {
+        "node=\(nodeId) block=\(blockRef.oid) content=\(hasMountedContent ? "mounted" : "NONE")"
+            + (isMagnifiedState ? " magnified" : "") + (isFocused ? " focused" : "")
+    }
+}

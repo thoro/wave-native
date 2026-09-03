@@ -57,3 +57,23 @@ wave-native/
    e2e harness in `docs/E2E.md` green against a real `wavesrv` — that proves the
    contract before any UI.
 3. Then terminal (libghostty) → layout → web → chrome, per `docs/ROADMAP.md`.
+
+## Diagnosing a running instance
+
+An invisible view that swallows clicks (a pane frame parked at a stale magnify
+frame, an overlay a drag left behind) cannot be seen from the outside, and a
+relaunch with the test driver destroys the state. Dump the LIVE view hierarchy
+through the always-on control socket instead:
+
+```
+scripts/dumpviews.sh                       # every window -> <dataHome>/wave-native-viewdump.txt
+scripts/dumpviews.sh /tmp/dump.txt 640 400 # + the hit-test chain at (640,400) in the key window
+```
+
+Points use a top-left origin in the window's content (screenshot coordinates).
+Each line carries the facts hit-testing depends on (frame, HIDDEN, alpha, layer
+z-order, running animations) plus the layout tree's own bookkeeping (tracked
+panes, magnified/focused ids, in-flight animation sets) — an untracked pane frame
+or a `magnified=nil` tree with a `z=1` pane is the phantom. `DATA_HOME=...`
+targets a `scripts/drive.sh` instance. The op itself is `DUMPVIEWS [path] [x y]`
+on `<dataHome>/wave-native.sock` (`AppInstanceOp.dumpViews`).
