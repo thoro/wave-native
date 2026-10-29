@@ -31,6 +31,12 @@ final class BlockFrameView: NSView {
     private let headerView = NSView()
     private let titleField = NSTextField(labelWithString: "")
     private let iconField = NSImageView()
+    /// `wsh badge` marker between the icon and the title (Electron blockframe-header).
+    private let badgeView = BadgeIndicatorView(pointSize: 11)
+    private var titleLeadingDefault: NSLayoutConstraint?
+    private var titleLeadingAfterBadge: NSLayoutConstraint?
+    private var badgeToken: SubscriptionToken?
+    private var isWebHeader = false
     /// Compact `display:name` label for WEB panes (which replace the title with the
     /// nav chrome); zero-width when the pane has no name.
     private let webNameField = NSTextField(labelWithString: "")
@@ -215,7 +221,7 @@ final class BlockFrameView: NSView {
     /// clipped out until the grow finished (reading as "no animation at all").
     override var isFlipped: Bool { true }
 
-    deinit { storeToken?.cancel(); connToken?.cancel() }
+    deinit { storeToken?.cancel(); connToken?.cancel(); badgeToken?.cancel() }
 
     /// Dim the pane's inner background so a translucent window shows the blur/desktop
     /// behind it. Driven by `RootContentView.applyAppearance`; 1 restores the solid bg.
@@ -263,6 +269,10 @@ final class BlockFrameView: NSView {
         iconField.contentTintColor = Theme.textSecondary.withAlphaComponent(0.5)
         iconField.translatesAutoresizingMaskIntoConstraints = false
         headerView.addSubview(iconField)
+
+        badgeView.isHidden = true
+        badgeView.translatesAutoresizingMaskIntoConstraints = false
+        headerView.addSubview(badgeView)
 
         titleField.font = Theme.headerFont
         titleField.textColor = Theme.textPrimary.withAlphaComponent(0.7)
@@ -366,7 +376,9 @@ final class BlockFrameView: NSView {
             iconField.centerYAnchor.constraint(equalTo: headerView.centerYAnchor),
             iconField.widthAnchor.constraint(equalToConstant: 16),
 
-            titleField.leadingAnchor.constraint(equalTo: iconField.trailingAnchor, constant: Theme.headerGap),
+            badgeView.leadingAnchor.constraint(equalTo: iconField.trailingAnchor, constant: Theme.headerGap),
+            badgeView.centerYAnchor.constraint(equalTo: headerView.centerYAnchor),
+
             titleField.trailingAnchor.constraint(lessThanOrEqualTo: magnifyButton.leadingAnchor, constant: -5),
             titleField.centerYAnchor.constraint(equalTo: headerView.centerYAnchor),
 
@@ -410,6 +422,11 @@ final class BlockFrameView: NSView {
         webNavLeadingAfterName = webNavBar.leadingAnchor.constraint(
             equalTo: webNameField.trailingAnchor, constant: Theme.headerGap)
         webNavLeadingDefault?.isActive = true
+        titleLeadingDefault = titleField.leadingAnchor.constraint(
+            equalTo: iconField.trailingAnchor, constant: Theme.headerGap)
+        titleLeadingAfterBadge = titleField.leadingAnchor.constraint(
+            equalTo: badgeView.trailingAnchor, constant: Theme.headerGap)
+        titleLeadingDefault?.isActive = true
     }
 
     private func mountContent(viewType: String?) {
@@ -453,6 +470,9 @@ final class BlockFrameView: NSView {
         connToken = env.connections?.subscribe { [weak self] in
             DispatchQueue.main.async { [weak self] in self?.refreshConnectionState() }
         }
+        badgeToken = env.badges?.subscribe { [weak self] in
+            DispatchQueue.main.async { [weak self] in self?.refreshBadge() }
+        }
     }
 
     private func applyBlock(_ block: Block?) {
@@ -469,6 +489,8 @@ final class BlockFrameView: NSView {
         // between the icon and the nav chrome.
         webNavBar.isHidden = !isWebBlock
         titleField.isHidden = isWebBlock
+        isWebHeader = isWebBlock
+        refreshBadge()
         webNameField.stringValue = isWebBlock ? (currentDisplayName ?? "") : ""
         webNameField.isHidden = !isWebBlock || currentDisplayName == nil
         let named = isWebBlock && currentDisplayName != nil
@@ -502,6 +524,16 @@ final class BlockFrameView: NSView {
             iconField.contentTintColor = Theme.textSecondary.withAlphaComponent(0.5)
         }
         mountContent(viewType: viewType)
+    }
+
+    /// Show this block's badge next to the title. Web headers have no title slot (the
+    /// nav bar fills it), so they show only the tab-pill badge.
+    private func refreshBadge() {
+        let badge = isWebHeader ? nil : env.badges?.blockBadge(blockRef.oid)
+        badgeView.badges = badge.map { [$0] } ?? []
+        titleLeadingDefault?.isActive = false
+        titleLeadingAfterBadge?.isActive = false
+        (badge == nil ? titleLeadingDefault : titleLeadingAfterBadge)?.isActive = true
     }
 
     /// Re-derive the terminal header's connection title/icon/tint from the current

@@ -456,6 +456,14 @@ final class ServiceClient: Sendable {
         return try await transport.call(command: "termscrollbacklist", data: none)
     }
 
+    /// `[wsh] TermDeleteOrphanedBuffersCommand` (cmd "termdeleteorphanedbuffers"):
+    /// delete the whole filestore zone of every orphaned term buffer. Orphan
+    /// status is recomputed server-side. Returns the number of zones deleted.
+    func termDeleteOrphanedBuffers() async throws -> Int {
+        let none: JSONValue? = nil
+        return try await transport.call(command: "termdeleteorphanedbuffers", data: none)
+    }
+
     /// `[wsh] TermGetRunningCommandsCommand` (cmd "termgetrunningcommands"): child
     /// processes still running under the LOCAL shells of the given scope (one
     /// block, one tab, or a whole workspace). Backs the close confirmations —
@@ -613,6 +621,20 @@ final class ServiceClient: Sendable {
     func connStatus() async throws -> [ConnStatus] {
         let none: JSONValue? = nil
         return try await transport.call(command: "connstatus", data: none)
+    }
+
+    /// `[wsh] GetAllBadgesCommand` (cmd "getallbadges"). The backend's transient badge
+    /// snapshot, so a window opened after `wsh badge` still shows existing badges.
+    func getAllBadges() async throws -> [BadgeEvent] {
+        let none: JSONValue? = nil
+        return try await transport.call(command: "getallbadges", data: none)
+    }
+
+    /// Publish a `badge` WPS event (cmd "eventpublish"), scoped to its oref like
+    /// `wsh badge` does. The backend store and every window apply it via the broadcast.
+    func publishBadgeEvent(_ event: BadgeEvent) async throws {
+        let wave = WaveEvent(event: WaveEventName.badge, scopes: [event.oref], data: try JSONValue.encode(event))
+        try await transport.callVoid(command: "eventpublish", data: wave)
     }
 
     /// `[wsh] ConnListCommand` (`wshclient.go:123`, cmd "connlist"). The configured

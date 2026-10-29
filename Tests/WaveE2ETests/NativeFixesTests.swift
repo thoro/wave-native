@@ -984,6 +984,62 @@ final class NativeFixesTests: XCTestCase {
         }
     }
 
+    // The window can be grabbed anywhere on the chrome that is not an interactive child:
+    // under the traffic lights, in the margin around the gear, and on the widget bar
+    // below its buttons — even when the pill strip is full and has no free span. Pure
+    // hit-test/responder-chain assertion, no HID.
+    func testChromeOutsideInteractiveChildrenResolvesToWindowDragSurface() {
+        let host = NSView(frame: NSRect(x: 0, y: 0, width: 700, height: Theme.tabBarHeight))
+        let bar = TabBarView()
+        bar.frame = host.bounds
+        host.addSubview(bar)
+        bar.position = "top"
+        bar.setTabs((1...20).map { TabBarItem(tabId: "t\($0)", name: "Tab \($0)") }, activeTabId: "t1")
+        host.layoutSubtreeIfNeeded()
+
+        let underTrafficLights = NSPoint(x: 20, y: Theme.tabBarHeight / 2)
+        let gearMargin = NSPoint(x: bar.bounds.maxX - 3, y: Theme.tabBarHeight / 2)
+        for point in [underTrafficLights, gearMargin] {
+            XCTAssertTrue(Self.resolvesToWindowDragSurface(host.hitTest(point)),
+                          "\(point) on a full strip must reach a window-drag surface")
+        }
+        guard let pill = Self.firstPill(in: bar) else {
+            XCTFail("strip must host pills")
+            return
+        }
+        let onPill = pill.convert(NSPoint(x: 5, y: 5), to: host)
+        XCTAssertFalse(Self.resolvesToWindowDragSurface(host.hitTest(onPill)),
+                       "a pill must keep its own press")
+
+        let widgets = WidgetBarView(frame: NSRect(x: 0, y: 0, width: Theme.widgetBarWidth, height: 400))
+        widgets.setItems([WidgetItem(icon: "terminal", label: nil, color: nil, blockDefMeta: [:],
+                                     order: 0, hidden: false, magnified: false)])
+        widgets.layoutSubtreeIfNeeded()
+        XCTAssertTrue(Self.resolvesToWindowDragSurface(widgets.hitTest(NSPoint(x: 10, y: 300))),
+                      "the widget column below its buttons must reach a window-drag surface")
+    }
+
+    private static func firstPill(in view: NSView) -> TabPillView? {
+        for sub in view.subviews {
+            if let pill = sub as? TabPillView { return pill }
+            if let pill = firstPill(in: sub) { return pill }
+        }
+        return nil
+    }
+
+    /// Walk up from the hit view: the first view that either consumes a press (an
+    /// interactive chrome child) or is a `WindowDragSurface` decides who gets the drag.
+    private static func resolvesToWindowDragSurface(_ hit: NSView?) -> Bool {
+        var view = hit
+        while let v = view {
+            if v is WindowDragSurface { return true }
+            if v is TabPillView || v is PlusButton || v is ChromeIconButton
+                || v is WorkspaceSwitcherView || v is NSControl { return false }
+            view = v.superview
+        }
+        return false
+    }
+
     // MARK: - Tab drag & drop
 
     // Dropping a tab at an insertion index yields the right new order. `dropIndex` is an

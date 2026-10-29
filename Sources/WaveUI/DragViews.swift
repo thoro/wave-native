@@ -18,9 +18,13 @@
 // A click still reached the pill (a press with no movement never starts a window
 // drag), but the moment the pointer moved past AppKit's drag slop the native window
 // move pre-empted the pill's NSDraggingSession — i.e. dragging a tab moved the
-// window. So the backdrop is non-draggable and window dragging is provided only by
-// explicit `DragView` fillers laid out over the genuinely-empty strip regions, where
-// nothing draggable ever sits behind a pill.
+// window. So NO view opts into `mouseDownCanMoveWindow`; instead every chrome surface
+// (the strip itself, the widget bar, the `DragView` fillers) starts the window drag
+// EXPLICITLY from `mouseDown` via `handleChromeMouseDown`. Because that only runs for
+// a press no interactive child consumed (pills, buttons and the switcher all swallow
+// their mouseDown), the whole strip — under the traffic lights, the gaps between
+// pills, the margin around the gear — moves the window without ever pre-empting a
+// pill drag.
 
 import AppKit
 
@@ -35,15 +39,33 @@ final class NonDragView: NSView {
     override var mouseDownCanMoveWindow: Bool { false }
 }
 
-/// A container that IS draggable (filler regions of the strip). The window has NO
-/// native drag region (`WaveWindow.isMovable == false` — the server-side title-bar
-/// region captured pill drags before the app saw them), so this view starts the
-/// window drag EXPLICITLY. `performDrag(with:)` hands the gesture to the system
-/// (native movement incl. edge snapping), and works while `isMovable` is false.
-final class DragView: NSView {
+/// Marker for a chrome view whose unhandled press moves the window (see
+/// `handleChromeMouseDown`). Lets layout tests assert that a point on the chrome
+/// resolves to a drag surface and not to an interactive child.
+protocol WindowDragSurface: NSView {}
+
+/// Shared `mouseDown` for every `WindowDragSurface`. The window has NO native drag
+/// region (`WaveWindow.isMovable == false` — the server-side title-bar region captured
+/// pill drags before the app saw them), so the drag is started EXPLICITLY here:
+/// `performDrag(with:)` hands the gesture to the system (native movement incl. edge
+/// snapping) and works while `isMovable` is false. A double-click is the title-bar
+/// action (zoom/minimize per the user's system setting) instead of a drag.
+func handleChromeMouseDown(_ event: NSEvent, in view: NSView) {
+    guard let window = view.window else { return }
+    if event.clickCount == 2 {
+        (window as? WaveWindow)?.performTitleBarDoubleClickAction()
+        return
+    }
+    window.performDrag(with: event)
+}
+
+/// A container that IS draggable (filler regions of the strip). Redundant with the
+/// strip's own `mouseDown` for dragging, but it stays as the required-width cap in the
+/// strip's constraint chain (see `TabBarView.setup`).
+final class DragView: NSView, WindowDragSurface {
     override var mouseDownCanMoveWindow: Bool { false }
     override func mouseDown(with event: NSEvent) {
-        window?.performDrag(with: event)
+        handleChromeMouseDown(event, in: self)
     }
 }
 

@@ -1261,6 +1261,7 @@ public struct BlockEnvFactory: Sendable {
     let onNotification: (@Sendable (String, String, String?, String) -> Void)?
     let onClipboardCopy: (@Sendable (Data) -> Void)?
     let connections: ConnectionStore?
+    let badges: BadgeStore?
     let termThemes: [TermThemeMenuItem]
     let defaultTermThemeName: String
 
@@ -1278,6 +1279,7 @@ public struct BlockEnvFactory: Sendable {
         onNotification: (@Sendable (String, String, String?, String) -> Void)? = nil,
         onClipboardCopy: (@Sendable (Data) -> Void)? = nil,
         connections: ConnectionStore? = nil,
+        badges: BadgeStore? = nil,
         termThemes: [TermThemeMenuItem] = [],
         defaultTermThemeName: String = "default-dark"
     ) {
@@ -1297,6 +1299,7 @@ public struct BlockEnvFactory: Sendable {
         self.onNotification = onNotification
         self.onClipboardCopy = onClipboardCopy
         self.connections = connections
+        self.badges = badges
         self.termThemes = termThemes
         self.defaultTermThemeName = defaultTermThemeName
     }
@@ -1309,7 +1312,8 @@ public struct BlockEnvFactory: Sendable {
             onSplit: onSplit, onMagnify: onMagnify, onClose: onClose,
             onPickConnection: onPickConnection, onOpenWebURL: onOpenWebURL, onRequestFocus: onRequestFocus,
             onBell: onBell, onNotification: onNotification, onClipboardCopy: onClipboardCopy,
-            connections: connections, termThemes: termThemes, defaultTermThemeName: defaultTermThemeName)
+            connections: connections, badges: badges, termThemes: termThemes,
+            defaultTermThemeName: defaultTermThemeName)
     }
 }
 

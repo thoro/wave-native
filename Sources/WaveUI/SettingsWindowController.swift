@@ -530,7 +530,7 @@ public final class SettingsWindowController: NSWindowController {
     /// Vertical stack rebuilt on each refresh with one row per stored buffer.
     private var scrollbackStack: NSStackView?
 
-    /// The entries behind the currently rendered buffer rows (Clear All input).
+    /// The entries behind the currently rendered buffer rows (Clear All / Delete Orphaned input).
     private var scrollbackEntries: [TermScrollbackEntry] = []
 
     private func addScrollbackListRow() {
@@ -555,6 +555,15 @@ public final class SettingsWindowController: NSWindowController {
         clearAll.action = #selector(ControlAction.fire(_:))
         retainedAdapters.append(clearAllTarget)
         buttons.addArrangedSubview(clearAll)
+
+        let deleteOrphaned = NSButton(title: "Delete Orphaned", target: nil, action: nil)
+        deleteOrphaned.bezelStyle = .accessoryBarAction
+        deleteOrphaned.controlSize = .small
+        let deleteOrphanedTarget = ControlAction { [weak self] _ in self?.confirmDeleteOrphanedBuffers() }
+        deleteOrphaned.target = deleteOrphanedTarget
+        deleteOrphaned.action = #selector(ControlAction.fire(_:))
+        retainedAdapters.append(deleteOrphanedTarget)
+        buttons.addArrangedSubview(deleteOrphaned)
 
         addSpanningRow(buttons, topPadding: 4)
 
@@ -598,6 +607,24 @@ public final class SettingsWindowController: NSWindowController {
                 for blockId in ids {
                     try? await coordinator.termClearBuffer(blockId: blockId)
                 }
+                self.reloadScrollbackList()
+            }
+        }
+    }
+
+    private func confirmDeleteOrphanedBuffers() {
+        let count = scrollbackEntries.filter { $0.orphaned == true }.count
+        guard let window, count > 0 else { return }
+        let alert = NSAlert()
+        alert.messageText = "Delete orphaned terminal buffers?"
+        alert.informativeText = "This permanently deletes the stored output files no tab references anymore (\(count) buffers)."
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Delete Orphaned")
+        alert.addButton(withTitle: "Cancel")
+        alert.beginSheetModal(for: window) { [weak self] response in
+            guard response == .alertFirstButtonReturn, let self, let coordinator = self.coordinator else { return }
+            Task { @MainActor in
+                try? await coordinator.termDeleteOrphanedBuffers()
                 self.reloadScrollbackList()
             }
         }

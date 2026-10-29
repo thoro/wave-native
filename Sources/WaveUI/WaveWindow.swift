@@ -114,8 +114,9 @@ final class WaveWindow: NSWindow {
         // window server owns the title-bar drag region and captures the gesture BEFORE
         // the app sees the mouseDown — a tab-pill drag also dragged the whole window
         // (freezing isMovable inside the pill's mouseDown was already too late). With
-        // isMovable off permanently, window dragging is provided ONLY by the explicit
-        // `DragView` fillers, which run `performDrag(with:)` themselves.
+        // isMovable off permanently, window dragging is provided ONLY by the chrome
+        // views (tab strip, widget bar, `DragView` fillers), which run
+        // `performDrag(with:)` themselves from mouseDown (see DragViews.swift).
         isMovable = false
         backgroundColor = Theme.windowBackground
         appearance = NSAppearance(named: .darkAqua)
@@ -163,12 +164,9 @@ final class WaveWindow: NSWindow {
         return onKeyEquivalent?(event) ?? false
     }
 
-    /// Double-click on the tab strip (our custom title bar) zooms/minimizes per the user's
-    /// "Double-click a window's title bar to…" setting. The strip's drag regions use
-    /// `mouseDownCanMoveWindow`, which AppKit consumes for the window drag BEFORE the view
-    /// sees mouseDown — so the view can't detect the double-click. `sendEvent` runs first, so
-    /// we catch it here, and hit-test to a drag region (not a tab/button, which handle their
-    /// own double-click, e.g. inline rename) so only the empty strip triggers it.
+    /// Runs before hit-testing: clears a stale pane-drop ring and, for the click that
+    /// activates the window, focuses the pane under it (click-through would otherwise
+    /// drop the event before the pane's own mouseDown focus path can run).
     override func sendEvent(_ event: NSEvent) {
         if event.type == .leftMouseDown {
             // Drag destinations do not receive every cancellation path. Clear a
@@ -178,12 +176,6 @@ final class WaveWindow: NSWindow {
             let isActivationClick = !isKeyWindow || Self.appActivationClickPending
             Self.appActivationClickPending = false
             if isActivationClick { focusPane(under: event) }
-        }
-        if event.type == .leftMouseDown, event.clickCount == 2,
-           let hit = contentView?.hitTest(event.locationInWindow),
-           hit is TabStripBackgroundView || hit is DragView {
-            performTitleBarDoubleClickAction()
-            return
         }
         super.sendEvent(event)
     }
@@ -203,7 +195,11 @@ final class WaveWindow: NSWindow {
         }
     }
 
-    private func performTitleBarDoubleClickAction() {
+    /// Double-click on the window chrome (our custom title bar) zooms/minimizes per the
+    /// user's "Double-click a window's title bar to…" setting. Called from the chrome
+    /// views' mouseDown (`handleChromeMouseDown`), so only a press no tab/button consumed
+    /// (those handle their own double-click, e.g. inline rename) triggers it.
+    func performTitleBarDoubleClickAction() {
         switch UserDefaults.standard.string(forKey: "AppleActionOnDoubleClick") {
         case "Minimize": performMiniaturize(nil)
         case "None", "Off": break

@@ -10,7 +10,7 @@ import AppKit
 import WaveCore
 
 /// The vertical launcher column pinned to the window's right edge.
-final class WidgetBarView: NSView {
+final class WidgetBarView: NSView, WindowDragSurface {
     /// Fired when a widget button is clicked: carries the block `meta` to create and
     /// whether it should open magnified. Wired by `WaveWindowController` to
     /// `AppCoordinator.createWidgetBlock`.
@@ -35,6 +35,12 @@ final class WidgetBarView: NSView {
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
     override var isFlipped: Bool { true }
+
+    /// The column outside the launcher buttons is window chrome: a press there moves
+    /// the window (the buttons consume their own clicks).
+    override func mouseDown(with event: NSEvent) {
+        handleChromeMouseDown(event, in: self)
+    }
 
     private func setup() {
         stack.orientation = .vertical

@@ -31,9 +31,9 @@ public struct WorkspaceMenuItem: Equatable, Sendable {
     public let hasSavedLayout: Bool
     /// THE workspace sort order: every workspace list in the app (switcher
     /// dropdown, task pane pickers/menus) sorts with this same comparator.
-    /// The SWITCHER surfaces (dropdown, Cmd-Shift-O) layer `recencyOrder` on
-    /// top at display time; index-keyed lists (the Workspace menu's Cmd-Ctrl-1..9)
-    /// stay on pure name order so their shortcuts don't re-map.
+    /// Only the Cmd-Shift-O overlay layers `recencyOrder` on top at display
+    /// time; the dropdown and index-keyed lists (the Workspace menu's
+    /// Cmd-Ctrl-1..9) stay on pure name order so rows and shortcuts don't re-map.
     public static func nameOrder(_ a: String, _ b: String) -> Bool {
         return a.localizedCaseInsensitiveCompare(b) == .orderedAscending
     }
@@ -82,10 +82,6 @@ final class WorkspaceSwitcherView: NSView {
     var onSaveWorkspaceLayout: ((String) -> Void)?
     /// Row right-click "Reset to Saved Layout": rebuild this workspace to its snapshot. Carries the workspaceId.
     var onResetWorkspaceLayout: ((String) -> Void)?
-    /// Live workspaceId → last-focus stamps (WindowManager). Read at dropdown-open
-    /// time so the rows sort most-recently-focused first with zero refresh plumbing.
-    var recencyProvider: (() -> [String: Double])?
-
     private let button = NonDragView()
     private let iconView = NSImageView()
     private let nameField = NSTextField(labelWithString: "")
@@ -205,8 +201,41 @@ final class WorkspaceSwitcherView: NSView {
             // strip would render every button as the generic circle fallback.
             "square-terminal": "terminal.fill", "list-tree": "list.bullet.indent",
             "browser": "globe", "list-check": "checklist",
+            // Common `wsh badge` icons (FontAwesome names agents/scripts actually send).
+            "triangle-exclamation": "exclamationmark.triangle.fill",
+            "circle-exclamation": "exclamationmark.circle.fill",
+            "exclamation": "exclamationmark", "circle-check": "checkmark.circle.fill",
+            "check": "checkmark", "circle-xmark": "xmark.circle.fill", "xmark": "xmark",
+            "circle-question": "questionmark.circle.fill", "question": "questionmark",
+            "circle-info": "info.circle.fill", "bell": "bell.fill", "flag": "flag.fill",
+            "hourglass": "hourglass", "hourglass-half": "hourglass", "clock": "clock.fill",
+            "spinner": "arrow.triangle.2.circlepath", "circle-play": "play.circle.fill",
+            "circle-pause": "pause.circle.fill", "circle-stop": "stop.circle.fill",
+            "robot": "cpu", "bug": "ladybug.fill", "fire": "flame.fill", "eye": "eye.fill",
+            "lock": "lock.fill", "comment": "bubble.left.fill", "message": "message.fill",
+            "power-off": "power", "power": "power", "plug": "powerplug.fill",
+            "skull": "exclamationmark.octagon.fill", "ban": "nosign", "pause": "pause.fill",
+            "play": "play.fill", "stop": "stop.fill", "trash": "trash.fill",
+            "server": "server.rack", "database": "cylinder.fill", "user": "person.fill",
+            "battery-empty": "battery.0percent", "sleep": "moon.zzz.fill",
         ]
-        return map[name] ?? defaultIconSymbol
+        return map[name] ?? guessedSymbolName(forFontAwesome: name) ?? defaultIconSymbol
+    }
+
+    /// Best-effort FontAwesome → SF Symbol for names not in the table, so an agent's
+    /// `wsh badge <icon>` isn't silently flattened to a dot: an SF Symbol name passed
+    /// verbatim, then `circle-x` → `x.circle.fill` and `a-b` → `a.b(.fill)`. Only
+    /// names AppKit actually resolves are returned.
+    static func guessedSymbolName(forFontAwesome name: String) -> String? {
+        var candidates = [name]
+        let parts = name.split(separator: "-").map(String.init)
+        if parts.count > 1, let shape = parts.first, ["circle", "square"].contains(shape) {
+            let rest = parts.dropFirst().joined(separator: ".")
+            candidates += ["\(rest).\(shape).fill", "\(rest).\(shape)"]
+        }
+        let dotted = parts.joined(separator: ".")
+        candidates += ["\(dotted).fill", dotted]
+        return candidates.first { NSImage(systemSymbolName: $0, accessibilityDescription: nil) != nil }
     }
 
     /// Render a Wave/FontAwesome icon name as a native SF Symbol image.
@@ -220,13 +249,8 @@ final class WorkspaceSwitcherView: NSView {
     func setItems(_ items: [WorkspaceMenuItem]) {
         self.items = items
         if let dropdown, dropdown.isShown {
-            dropdown.controller.setItems(displayOrdered(items), active: activeWorkspaceId)
+            dropdown.controller.setItems(items, active: activeWorkspaceId)
         }
-    }
-
-    private func displayOrdered(_ items: [WorkspaceMenuItem]) -> [WorkspaceMenuItem] {
-        guard let stamps = recencyProvider?(), !stamps.isEmpty else { return items }
-        return WorkspaceMenuItem.recencyOrder(items, stamps: stamps)
     }
 
     override func mouseDown(with event: NSEvent) {
@@ -277,7 +301,7 @@ final class WorkspaceSwitcherView: NSView {
         let controller = WorkspaceMenuController()
         controller.palette = (paletteColors, paletteIcons)
         controller.activeIsSaved = activeIsSaved
-        controller.setItems(displayOrdered(items), active: activeWorkspaceId)
+        controller.setItems(items, active: activeWorkspaceId)
         controller.onSelect = { [weak self] id in
             self?.dropdown?.close()
             self?.onSelectWorkspace?(id)

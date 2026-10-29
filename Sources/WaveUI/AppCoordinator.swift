@@ -211,6 +211,14 @@ public final class AppCoordinator {
     /// colour their connection icon and show the connect overlay.
     let connectionStore = ConnectionStore()
 
+    /// Live `wsh badge` state (seeded by `getallbadges`, kept current by the `badge`
+    /// event). Drives the tab-pill badges and, via `BlockEnv`, the header badge.
+    let badgeStore = BadgeStore()
+    private var badgeStoreToken: SubscriptionToken?
+    /// Pending auto-clear of the badge on the pane the user is looking at.
+    private var badgeAutoClear: DispatchWorkItem?
+    private var lastBadgeFocusKey: String?
+
     // Live subscriptions.
     private var eventTokens: [SubscriptionToken] = []
     private var workspaceToken: SubscriptionToken?
@@ -324,6 +332,7 @@ public final class AppCoordinator {
             // §7.7 — full config (theme/settings).
             await loadFullConfig()
             await seedConnections()
+            await seedBadges()
 
             // §7.9 — ready. Push initial UI and activate the current tab (the
             // backend controller-start trigger, GUARDS §C).
@@ -366,6 +375,7 @@ public final class AppCoordinator {
             WaveEventName.connChange,
             WaveEventName.blockFile,
             WaveEventName.userInput,
+            WaveEventName.badge,
         ]
         for name in names {
             let token = transport.subscribe(SubscriptionRequest(event: name, allscopes: true)) { [weak self] event in
@@ -423,6 +433,12 @@ public final class AppCoordinator {
         // filter here or every window would pop the same dialog.
         if event.event == WaveEventName.userInput {
             handleUserInputEvent(event)
+            return
+        }
+        if event.event == WaveEventName.badge {
+            if let data = try? event.data?.decode(BadgeEvent.self) {
+                badgeStore.apply(data)
+            }
             return
         }
         guard event.event == WaveEventName.waveObjUpdate, let data = event.data else { return }
@@ -565,6 +581,7 @@ public final class AppCoordinator {
         unreadTabs.remove(tabId)
         // Optimistically reflect the selection.
         publishTabs()
+        scheduleBadgeAutoClear()
 
         // Load the tab + its layout, then mount tiles.
         let tab = await loadTabSafe(tabId)
@@ -1481,7 +1498,8 @@ public final class AppCoordinator {
             let bgPreset = tab?.meta["tab:background"]?.stringValue
             return TabBarItem(tabId: id, name: name.isEmpty ? "Tab" : name, flagColor: flagColor,
                               hasUnread: unreadTabs.contains(id),
-                              backgroundPresetKey: (bgPreset?.isEmpty == false) ? bgPreset : nil)
+                              backgroundPresetKey: (bgPreset?.isEmpty == false) ? bgPreset : nil,
+                              badges: badgeStore.tabBadges(tabId: id, blockIds: tab?.blockids ?? []))
         }
         delegate?.coordinatorDidUpdateTabs(tabs, activeTabId: activeTabId)
         publishTabBackground()
@@ -1676,6 +1694,7 @@ public final class AppCoordinator {
                 }
             },
             connections: connectionStore,
+            badges: badgeStore,
             termThemes: termThemeMenuItems(),
             defaultTermThemeName: currentSettings()["term:theme"]?.stringValue.flatMap {
                 $0.isEmpty ? nil : $0
@@ -1683,6 +1702,7 @@ public final class AppCoordinator {
         delegate?.coordinatorDidUpdateLayout(
             env: env, root: rootNode, focusedNodeId: tree.focusedNodeId,
             magnifiedNodeId: tree.magnifiedNodeId)
+        scheduleBadgeAutoClear()
     }
 
     /// Recursively drop layout leaves whose block fails `isBlockResolvable`, collapsing
@@ -1962,6 +1982,12 @@ public final class AppCoordinator {
         try await service.termScrollbackList()
     }
 
+    /// Delete every orphaned term buffer zone; returns how many were deleted.
+    @discardableResult
+    public func termDeleteOrphanedBuffers() async throws -> Int {
+        try await service.termDeleteOrphanedBuffers()
+    }
+
     /// Truncate one block's persisted term buffer.
     public func termClearBuffer(blockId: String) async throws {
         try await service.termClearBuffer(blockId: blockId)
@@ -2040,6 +2066,74 @@ public final class AppCoordinator {
             } catch {
                 self.delegate?.coordinatorDidFail(error)
             }
+        }
+    }
+
+    /// Subscribe the tab strip + auto-clear to badge changes, then seed the store from
+    /// the backend snapshot (badges set before this window opened). Best-effort.
+    private func seedBadges() async {
+        if badgeStoreToken == nil {
+            badgeStoreToken = badgeStore.subscribe { [weak self] in
+                Task { @MainActor in
+                    self?.publishTabs()
+                    self?.scheduleBadgeAutoClear()
+                }
+            }
+        }
+        if let snapshot = try? await service.getAllBadges() {
+            badgeStore.seed(snapshot)
+        }
+    }
+
+    /// The window became main: a badge on the focused pane is now actually seen.
+    public func windowDidBecomeMain() {
+        lastBadgeFocusKey = nil
+        scheduleBadgeAutoClear()
+    }
+
+    /// Electron `BadgeAutoClearing`: once the user is looking at a badged pane (its tab
+    /// active, window key, app frontmost) clear the badge — 0.5s after focus lands on
+    /// it, 3s when a badge arrives on the pane already focused. Tab-level badges clear
+    /// the same way while the tab is active. `--pid` badges are left for the pid watcher.
+    private func scheduleBadgeAutoClear() {
+        badgeAutoClear?.cancel()
+        badgeAutoClear = nil
+        guard let tabId = activeTabId else { return }
+        let blockId = currentFocusedBlockId()
+        let focusKey = "\(tabId)/\(blockId ?? "")"
+        let focusSwitched = focusKey != lastBadgeFocusKey
+        lastBadgeFocusKey = focusKey
+        let targets = Self.badgeAutoClearTargets(store: badgeStore, tabId: tabId, focusedBlockId: blockId)
+        guard !targets.isEmpty else { return }
+        let item = DispatchWorkItem { [weak self] in
+            guard let self, self.activeTabId == tabId, self.currentFocusedBlockId() == blockId,
+                  self.delegate?.coordinatorIsWindowKey() == true, NSApplication.shared.isActive
+            else { return }
+            for oref in Self.badgeAutoClearTargets(store: self.badgeStore, tabId: tabId, focusedBlockId: blockId) {
+                let service = self.service
+                Task {
+                    do {
+                        try await service.publishBadgeEvent(BadgeEvent(oref: oref, clear: true))
+                    } catch {
+                        NSLog("AppCoordinator: badge auto-clear failed: \(error)")
+                    }
+                }
+            }
+        }
+        badgeAutoClear = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + (focusSwitched ? 0.5 : 3), execute: item)
+    }
+
+    /// The orefs whose badge auto-clears while the user looks at `tabId` with
+    /// `focusedBlockId` focused: the focused block's and the tab's own, skipping
+    /// pid-linked badges. Pure → unit-testable.
+    static func badgeAutoClearTargets(store: BadgeStore, tabId: String, focusedBlockId: String?) -> [String] {
+        var orefs: [String] = []
+        if let focusedBlockId { orefs.append(ORef.block(focusedBlockId).string) }
+        orefs.append(ORef.tab(tabId).string)
+        return orefs.filter { oref in
+            guard let b = store.badge(for: oref) else { return false }
+            return b.pidlinked != true
         }
     }
 

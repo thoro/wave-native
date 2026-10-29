@@ -135,9 +135,6 @@ public final class WaveWindowController: NSWindowController, AppCoordinatorDeleg
         tabBar.onCloseTab = { [weak self] id in self?.coordinator.closeTab(id) }
         tabBar.onNewTab = { [weak self] in self?.coordinator.newTab() }
         tabBar.onSelectWorkspace = { [weak self] id in self?.navigateToWorkspace(id) }
-        tabBar.workspaceSwitcher.recencyProvider = { [weak self] in
-            self?.windowManager?.workspaceRecency ?? [:]
-        }
         tabBar.onCreateWorkspace = { [weak self] name in self?.createWorkspace(named: name) }
         tabBar.onRenameWorkspace = { [weak self] id, name in self?.coordinator.renameWorkspace(id, name: name) }
         tabBar.onSetWorkspaceColor = { [weak self] id, hex in self?.coordinator.setWorkspaceColor(id: id, color: hex) }
@@ -825,6 +822,7 @@ public final class WaveWindowController: NSWindowController, AppCoordinatorDeleg
     public func windowDidBecomeMain(_ notification: Notification) {
         activeLayoutView?.setWindowActive(true)
         windowManager?.noteWorkspaceFocused(self)
+        coordinator.windowDidBecomeMain()
     }
 
     public func windowDidResignMain(_ notification: Notification) {

@@ -63,17 +63,20 @@ public struct TabBarItem: Equatable, Sendable {
     /// `tab:background` meta (a named preset key like `bg@blue`), or nil. Drives the
     /// "Background" submenu checkmark.
     public let backgroundPresetKey: String?
+    /// `wsh badge` badges on this tab or any of its blocks, highest priority first.
+    public let badges: [Badge]
     public init(tabId: String, name: String, flagColor: String? = nil, hasUnread: Bool = false,
-                backgroundPresetKey: String? = nil) {
+                backgroundPresetKey: String? = nil, badges: [Badge] = []) {
         self.tabId = tabId
         self.name = name
         self.flagColor = flagColor
         self.hasUnread = hasUnread
         self.backgroundPresetKey = backgroundPresetKey
+        self.badges = badges
     }
 }
 
-final class TabBarView: NSView {
+final class TabBarView: NSView, WindowDragSurface {
     var onSelectTab: ((String) -> Void)?
     var onCloseTab: ((String) -> Void)?
     var onNewTab: (() -> Void)?
@@ -164,6 +167,15 @@ final class TabBarView: NSView {
     /// The gear button view, so the owner can anchor the per-window appearance popover to it.
     var settingsAnchorView: NSView { settingsButton }
 
+    /// Any press no interactive child consumed — the backdrop under the traffic lights,
+    /// a gap between pills, the margin around the "+" / gear — moves the window, so a
+    /// strip full of tabs still has somewhere to grab. Also swallows the event: an
+    /// unhandled mouseDown bubbling past the strip is re-routed by AppKit to whatever
+    /// is behind it.
+    override func mouseDown(with event: NSEvent) {
+        handleChromeMouseDown(event, in: self)
+    }
+
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         wantsLayer = true
@@ -217,8 +229,9 @@ final class TabBarView: NSView {
         tabsScroll.documentView = tabsContainer
         addSubview(tabsScroll)
 
-        // Above the backdrop (added first) so it hit-tests for the window drag, but it is
-        // constrained to empty regions only, so it never sits in front of a pill/button.
+        // Constrained to the empty span between the "+" and the gear: its non-negative
+        // width is the required cap in the constraint chain (see widthC below). The strip
+        // itself handles the window drag now, so the filler is layout-only in practice.
         dragFiller.translatesAutoresizingMaskIntoConstraints = false
         addSubview(dragFiller)
 
@@ -395,6 +408,7 @@ final class TabBarView: NSView {
             pill.isActive = (item.tabId == activeTabId)
             pill.flagColor = item.flagColor
             pill.hasUnread = item.hasUnread
+            pill.badges = item.badges
             pill.backgroundPresets = backgroundPresets
             pill.backgroundPresetKey = item.backgroundPresetKey
             pill.sourceWorkspaceId = activeWorkspaceId

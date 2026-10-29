@@ -94,6 +94,7 @@ final class TabPillView: NSView, NSTextFieldDelegate {
     private var outsideClickMonitor: Any?
     private let flagIndicator = NSImageView()
     private let bellIndicator = NSImageView()
+    private let badgeIndicator = BadgeIndicatorView(pointSize: 10)
     private let closeButton = NSButton()
     private var trackingArea: NSTrackingArea?
     private var isRenaming = false
@@ -128,6 +129,12 @@ final class TabPillView: NSView, NSTextFieldDelegate {
         didSet { if oldValue != hasUnread { refreshAppearance() } }
     }
 
+    /// `wsh badge` badges for this tab (sorted). When present they take the flag's
+    /// leading slot, with the flag folded in as a priority-0 badge (Electron `TabBadges`).
+    var badges: [Badge] = [] {
+        didSet { if oldValue != badges { refreshFlag() } }
+    }
+
     init(tabId: String, title: String) {
         self.tabId = tabId
         super.init(frame: .zero)
@@ -153,6 +160,10 @@ final class TabPillView: NSView, NSTextFieldDelegate {
         flagIndicator.isHidden = true
         flagIndicator.translatesAutoresizingMaskIntoConstraints = false
         inner.addSubview(flagIndicator)
+
+        badgeIndicator.isHidden = true
+        badgeIndicator.translatesAutoresizingMaskIntoConstraints = false
+        inner.addSubview(badgeIndicator)
 
         let bellConfig = NSImage.SymbolConfiguration(pointSize: 10, weight: .semibold)
         bellIndicator.image = NSImage(systemSymbolName: "bell.fill", accessibilityDescription: "Unread bell")?
@@ -205,6 +216,9 @@ final class TabPillView: NSView, NSTextFieldDelegate {
             flagIndicator.centerYAnchor.constraint(equalTo: inner.centerYAnchor),
             flagIndicator.widthAnchor.constraint(equalToConstant: 10),
             flagIndicator.heightAnchor.constraint(equalToConstant: 10),
+
+            badgeIndicator.leadingAnchor.constraint(equalTo: inner.leadingAnchor, constant: 5),
+            badgeIndicator.centerYAnchor.constraint(equalTo: inner.centerYAnchor),
 
             label.leadingAnchor.constraint(equalTo: inner.leadingAnchor, constant: 8),
             label.trailingAnchor.constraint(equalTo: inner.trailingAnchor, constant: -8),
@@ -262,7 +276,25 @@ final class TabPillView: NSView, NSTextFieldDelegate {
         return WorkspaceSwitcherView.color(from: flagColor) != nil
     }
 
+    /// Badges as drawn on the pill: the `wsh badge` set plus the flag as a priority-0
+    /// badge, or empty when there are no `wsh badge` badges (the plain flag path).
+    var displayedBadges: [Badge] {
+        guard !badges.isEmpty else { return [] }
+        guard isFlagVisible, let flagColor else { return badges }
+        // A fixed max-uuid id sorts the flag after real badges at equal priority.
+        let flag = Badge(badgeid: "ffffffff-ffff-7fff-bfff-ffffffffffff", icon: "flag", color: flagColor, priority: 0)
+        return BadgeStore.sortedForTab(badges + [flag])
+    }
+
     private func refreshFlag() {
+        let shown = displayedBadges
+        badgeIndicator.badges = shown
+        if !shown.isEmpty {
+            flagIndicator.isHidden = true
+            flagIndicator.needsDisplay = true
+            needsLayout = true
+            return
+        }
         guard let flagColor, let color = WorkspaceSwitcherView.color(from: flagColor) else {
             flagIndicator.isHidden = true
             flagIndicator.needsDisplay = true

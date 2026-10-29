@@ -550,6 +550,22 @@ final class TerminalKeyEncodingTests: XCTestCase {
             esc + Data("OB".utf8))
     }
 
+    /// DECCKM set (smkx; vim on a remote xterm-256color host) -> unmodified cursor/Home/End
+    /// use SS3; modified chords keep the CSI form.
+    func testApplicationCursorKeys() {
+        let esc = Data([0x1b])
+        for (key, final) in [(NSUpArrowFunctionKey, "A"), (NSDownArrowFunctionKey, "B"),
+                             (NSRightArrowFunctionKey, "C"), (NSLeftArrowFunctionKey, "D"),
+                             (NSHomeFunctionKey, "H"), (NSEndFunctionKey, "F")] {
+            XCTAssertEqual(GhosttyTerminalView.bytes(for: keyEvent(key, flags: []), applicationCursorKeys: true),
+                           esc + Data("O\(final)".utf8))
+            XCTAssertEqual(GhosttyTerminalView.bytes(for: keyEvent(key, flags: []), applicationCursorKeys: false),
+                           esc + Data("[\(final)".utf8))
+        }
+        XCTAssertEqual(GhosttyTerminalView.bytes(for: keyEvent(NSLeftArrowFunctionKey, flags: [.shift]), applicationCursorKeys: true),
+                       esc + Data("[1;2D".utf8))
+    }
+
     func testTildeKeyEncoding() {
         let esc = Data([0x1b])
         XCTAssertEqual(GhosttyTerminalView.csiTilde(3, 1), esc + Data("[3~".utf8))      // Delete

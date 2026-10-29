@@ -135,6 +135,8 @@ public struct BlockEnv: Sendable {
     /// Also the source of the local-machine display name. Optional so existing
     /// content-only callers/tests need not provide one.
     public let connections: ConnectionStore?
+    /// Live `wsh badge` state for the header badge. Optional like `connections`.
+    public let badges: BadgeStore?
     /// The web block's nav chrome <-> content bridge. Always present (one per block);
     /// only used when the block's view is "web".
     public let webNav: WebNavBridge
@@ -160,6 +162,7 @@ public struct BlockEnv: Sendable {
         onNotification: (@Sendable (String, String, String?, String) -> Void)? = nil,
         onClipboardCopy: (@Sendable (Data) -> Void)? = nil,
         connections: ConnectionStore? = nil,
+        badges: BadgeStore? = nil,
         webNav: WebNavBridge = WebNavBridge(),
         termThemes: [TermThemeMenuItem] = [],
         defaultTermThemeName: String = "default-dark"
@@ -181,6 +184,7 @@ public struct BlockEnv: Sendable {
         self.onNotification = onNotification
         self.onClipboardCopy = onClipboardCopy
         self.connections = connections
+        self.badges = badges
         self.webNav = webNav
         self.termThemes = termThemes
         self.defaultTermThemeName = defaultTermThemeName

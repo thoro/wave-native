@@ -1318,13 +1318,12 @@ public final class GhosttyTerminalView: NSView {
         // DECCKM (mode 1) picks SS3 vs CSI encoding, matching Ghostty proper.
         if altScreenActive() {
             var altScroll = true
-            var cursorApp = false
             sink.withTerminal { terminal in
                 _ = ghostty_terminal_mode_get(terminal, GhosttyMode(1007), &altScroll)
-                _ = ghostty_terminal_mode_get(terminal, GhosttyMode(1), &cursorApp)
             }
             guard altScroll else { return }
-            let seq = GhosttyTerminalView.alternateScrollSequence(up: deltaY > 0, applicationCursorKeys: cursorApp)
+            let seq = GhosttyTerminalView.alternateScrollSequence(
+                up: deltaY > 0, applicationCursorKeys: applicationCursorKeysEnabled())
             let steps = max(1, Int((abs(deltaY) / cellSize.height).rounded()))
             var data = Data()
             for _ in 0..<steps { data.append(seq) }
@@ -2471,6 +2470,15 @@ public final class GhosttyTerminalView: NSView {
         } else if row >= first + lastRows {
             scrollUnified(rows: row - (first + lastRows - 1))
         }
+    }
+
+    /// DECCKM (mode 1): cursor keys send SS3 instead of CSI.
+    private func applicationCursorKeysEnabled() -> Bool {
+        var on = false
+        sink.withTerminal { terminal in
+            _ = ghostty_terminal_mode_get(terminal, GhosttyMode(1), &on)
+        }
+        return on
     }
 
     /// Whether the terminal is on the ALTERNATE screen (vim/less/htop -- DEC
@@ -3850,7 +3858,7 @@ public final class GhosttyTerminalView: NSView {
         if GhosttyTerminalView.isDirectlyEncodedKey(
             flags: event.modifierFlags,
             scalar: event.charactersIgnoringModifiers?.unicodeScalars.first) {
-            if let data = GhosttyTerminalView.bytes(for: event) {
+            if let data = GhosttyTerminalView.bytes(for: event, applicationCursorKeys: applicationCursorKeysEnabled()) {
                 controller.sendInput(data)
             }
             return
@@ -3869,7 +3877,7 @@ public final class GhosttyTerminalView: NSView {
 
         // The IME consumed nothing and left no preedit (no input method active), so send
         // the raw characters — plain ASCII must still reach the pty.
-        if let data = GhosttyTerminalView.bytes(for: event) {
+        if let data = GhosttyTerminalView.bytes(for: event, applicationCursorKeys: applicationCursorKeysEnabled()) {
             controller.sendInput(data)
             hideCursorWhileTyping()
         }
@@ -3913,9 +3921,12 @@ public final class GhosttyTerminalView: NSView {
         return mod
     }
 
-    /// Cursor/Home/End: `ESC[<final>` unmodified, else `ESC[1;<mod><final>`.
-    static func csiCursor(_ final: String, _ mod: Int) -> Data {
-        mod == 1 ? esc("[\(final)") : esc("[1;\(mod)\(final)")
+    /// Cursor/Home/End: `ESC[<final>` unmodified, else `ESC[1;<mod><final>`. With DECCKM
+    /// (application cursor keys) set, unmodified keys use SS3 `ESC O<final>` like xterm:
+    /// apps that emit smkx (vim via xterm-256color terminfo) only know the kcuu1=`ESC OA` forms.
+    static func csiCursor(_ final: String, _ mod: Int, applicationCursorKeys: Bool = false) -> Data {
+        if mod == 1 { return esc(applicationCursorKeys ? "O\(final)" : "[\(final)") }
+        return esc("[1;\(mod)\(final)")
     }
 
     /// Alternate-scroll wheel encoding (DEC 1007): one cursor Up/Down per wheel
@@ -3930,7 +3941,7 @@ public final class GhosttyTerminalView: NSView {
         mod == 1 ? esc("[\(n)~") : esc("[\(n);\(mod)~")
     }
 
-    static func bytes(for event: NSEvent) -> Data? {
+    static func bytes(for event: NSEvent, applicationCursorKeys: Bool = false) -> Data? {
         let flags = event.modifierFlags
         // Cmd shortcuts are chrome concerns, not pty input.
         if flags.contains(.command) { return nil }
@@ -3979,12 +3990,12 @@ public final class GhosttyTerminalView: NSView {
             }
             let mod = csiModifier(flags)
             switch Int(scalar.value) {
-            case NSUpArrowFunctionKey: return csiCursor("A", mod)
-            case NSDownArrowFunctionKey: return csiCursor("B", mod)
-            case NSRightArrowFunctionKey: return csiCursor("C", mod)
-            case NSLeftArrowFunctionKey: return csiCursor("D", mod)
-            case NSHomeFunctionKey: return csiCursor("H", mod)
-            case NSEndFunctionKey: return csiCursor("F", mod)
+            case NSUpArrowFunctionKey: return csiCursor("A", mod, applicationCursorKeys: applicationCursorKeys)
+            case NSDownArrowFunctionKey: return csiCursor("B", mod, applicationCursorKeys: applicationCursorKeys)
+            case NSRightArrowFunctionKey: return csiCursor("C", mod, applicationCursorKeys: applicationCursorKeys)
+            case NSLeftArrowFunctionKey: return csiCursor("D", mod, applicationCursorKeys: applicationCursorKeys)
+            case NSHomeFunctionKey: return csiCursor("H", mod, applicationCursorKeys: applicationCursorKeys)
+            case NSEndFunctionKey: return csiCursor("F", mod, applicationCursorKeys: applicationCursorKeys)
             case NSPageUpFunctionKey: return csiTilde(5, mod)
             case NSPageDownFunctionKey: return csiTilde(6, mod)
             case NSDeleteFunctionKey: return csiTilde(3, mod)

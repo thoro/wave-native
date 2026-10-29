@@ -1,7 +1,7 @@
 // Copyright 2026, Command Line Inc.
 // SPDX-License-Identifier: Apache-2.0
 //
-// WorkspaceMenuItem.recencyOrder — the switcher surfaces' display order:
+// WorkspaceMenuItem.recencyOrder — the Cmd-Shift-O overlay's display order:
 // most-recently-focused first, never-focused trailing in name order. Pure.
 
 import XCTest

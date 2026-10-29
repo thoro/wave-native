@@ -88,6 +88,7 @@ public enum WaveEventName {
     public static let config = "config"
     public static let connChange = "connchange"
     public static let userInput = "userinput"
+    public static let badge = "badge"
 }
 
 /// File operations (`pkg/wps/wpstypes.go:79-85`).
@@ -258,6 +259,42 @@ public struct WaveEvent: Codable, Sendable {
     }
 
     public func hasScope(_ scope: String) -> Bool { scopes?.contains(scope) ?? false }
+}
+
+/// `Badge` (`pkg/baseds/baseds.go`) — a transient block/tab attention marker set by
+/// `wsh badge`. `badgeid` is a uuidv7, so its string order is creation order.
+public struct Badge: Codable, Sendable, Equatable {
+    public var badgeid: String
+    public var icon: String
+    public var color: String?
+    public var priority: Double
+    public var pidlinked: Bool?
+
+    public init(badgeid: String, icon: String, color: String? = nil, priority: Double, pidlinked: Bool? = nil) {
+        self.badgeid = badgeid
+        self.icon = icon
+        self.color = color
+        self.priority = priority
+        self.pidlinked = pidlinked
+    }
+}
+
+/// `BadgeEvent` (`pkg/baseds/baseds.go`) — the `badge` WPS event payload and the
+/// `getallbadges` snapshot row. Exactly one of clear/clearall/clearbyid/badge applies.
+public struct BadgeEvent: Codable, Sendable, Equatable {
+    public var oref: String
+    public var clear: Bool?
+    public var clearall: Bool?
+    public var clearbyid: String?
+    public var badge: Badge?
+
+    public init(oref: String, clear: Bool? = nil, clearall: Bool? = nil, clearbyid: String? = nil, badge: Badge? = nil) {
+        self.oref = oref
+        self.clear = clear
+        self.clearall = clearall
+        self.clearbyid = clearbyid
+        self.badge = badge
+    }
 }
 
 /// `UserInputRequest` (`pkg/userinput/userinput.go:30-41`) — a backend prompt during
