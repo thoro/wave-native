@@ -1,0 +1,128 @@
+# Release build — the signed + notarized WaveNative.app (macOS arm64), in two jobs so
+# the signing secrets never share a job with the build:
+#
+#   build    fetches wavesrv + wsh from the thoro/wavesrv release pinned in
+#            WAVESRV_VERSION (scripts/fetch-wavesrv.sh — the Go side is never built
+#            here), builds + bundles the app (scripts/bundle-app.sh) and hands it on
+#            unsigned. No secrets.
+#   release  only for a published release, in the `release` environment that holds the
+#            secrets: signs + notarizes (scripts/sign-and-notarize.sh) and attaches
+#            WaveNative-<version>-macos-arm64.zip to the release.
+#
+# Trigger: publishing a drafted release (see release-drafter) creates the tag and
+# fires `release: published`. `workflow_dispatch` is a dry run — the build job only;
+# its unsigned app is the workflow artifact.
+#
+# The secrets are ENVIRONMENT secrets of `release`, never repository secrets: a
+# repository secret is readable by a workflow on any branch, so anyone able to push one
+# (or dispatch from it) could print it. The environment only deploys `v*` tags.
+#   MACOS_CERT_P12        base64 of the exported "Developer ID Application" cert + key (.p12)
+#   MACOS_CERT_PASSWORD   the .p12 export password
+#   NOTARY_KEY_P8         contents of the App Store Connect API key (.p8)
+#   NOTARY_KEY_ID         that key's id
+#   NOTARY_ISSUER         that key's issuer id
+name: Release
+run-name: Release ${{ github.event.release.tag_name || github.sha }}
+on:
+    release:
+        types: [published]
+    workflow_dispatch:
+
+permissions:
+    contents: read
+
+jobs:
+    build:
+        runs-on: macos-latest # arm64, which is the only arch the app ships for
+        env:
+            TAG: ${{ github.event.release.tag_name }}
+        steps:
+            - uses: actions/checkout@v7
+
+            - name: Fetch wavesrv + wsh
+              run: ./scripts/fetch-wavesrv.sh
+
+            - name: Build + bundle
+              run: |
+                  set -euo pipefail
+                  # Dry runs keep the default short version; CFBundleVersion carries the
+                  # commit either way.
+                  VERSION=0.0.0
+                  if [ -n "$TAG" ]; then
+                      VERSION="${TAG#v}"
+                  fi
+                  echo "Version: $VERSION (wavesrv $(cat WAVESRV_VERSION))"
+                  WAVE_SHORT_VERSION="$VERSION" ./scripts/bundle-app.sh release
+                  # ditto, not zip: it keeps the bundle's exec bits and symlinks (and, in
+                  # the release job, the signature and the stapled ticket).
+                  ditto -c -k --keepParent dist/WaveNative.app dist/WaveNative-unsigned.zip
+
+            - uses: actions/upload-artifact@v7
+              with:
+                  name: WaveNative-unsigned
+                  path: dist/WaveNative-unsigned.zip
+                  retention-days: 7
+
+    release:
+        needs: build
+        if: github.event_name == 'release'
+        runs-on: macos-latest
+        environment: release
+        permissions:
+            contents: write # upload release assets
+        env:
+            TAG: ${{ github.event.release.tag_name }}
+        steps:
+            - uses: actions/checkout@v7
+
+            - uses: actions/download-artifact@v8
+              with:
+                  name: WaveNative-unsigned
+                  path: dist
+
+            - name: Unpack
+              run: ditto -x -k dist/WaveNative-unsigned.zip dist && rm dist/WaveNative-unsigned.zip
+
+            - name: Import signing certificate
+              env:
+                  MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+                  MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+              run: |
+                  set -euo pipefail
+                  if [ -z "$MACOS_CERT_P12" ]; then
+                      echo "::error::no signing secrets; set the MACOS_CERT_* and NOTARY_* secrets on the release environment (see release.yml)"
+                      exit 1
+                  fi
+                  KEYCHAIN="$RUNNER_TEMP/signing.keychain-db"
+                  KEYCHAIN_PW="$(openssl rand -base64 24)"
+                  echo "::add-mask::$KEYCHAIN_PW"
+                  security create-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN"
+                  security set-keychain-settings -lut 21600 "$KEYCHAIN"
+                  security unlock-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN"
+                  echo "$MACOS_CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+                  security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" -P "$MACOS_CERT_PASSWORD" -T /usr/bin/codesign
+                  rm "$RUNNER_TEMP/cert.p12"
+                  # Without the partition list codesign prompts for keychain access, which hangs a runner.
+                  security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PW" "$KEYCHAIN" >/dev/null
+                  security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
+
+            - name: Sign + notarize
+              env:
+                  NOTARY_KEY_P8: ${{ secrets.NOTARY_KEY_P8 }}
+                  WAVE_NOTARY_KEY_ID: ${{ secrets.NOTARY_KEY_ID }}
+                  WAVE_NOTARY_ISSUER: ${{ secrets.NOTARY_ISSUER }}
+              run: |
+                  set -euo pipefail
+                  export WAVE_NOTARY_KEY="$RUNNER_TEMP/notary.p8"
+                  printf '%s\n' "$NOTARY_KEY_P8" > "$WAVE_NOTARY_KEY"
+                  ./scripts/sign-and-notarize.sh
+                  rm "$WAVE_NOTARY_KEY"
+
+            - name: Publish to release
+              run: |
+                  set -euo pipefail
+                  ZIP="dist/WaveNative-${TAG#v}-macos-arm64.zip"
+                  ditto -c -k --keepParent dist/WaveNative.app "$ZIP"
+                  gh release upload "$TAG" "$ZIP" --clobber
+              env:
+                  GH_TOKEN: ${{ github.token }}

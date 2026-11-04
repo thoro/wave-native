@@ -1,0 +1,90 @@
+# Release Drafter config — maintains a single DRAFT GitHub Release whose notes and
+# resolved version are derived from merged PRs since the last published release.
+# The resolved version becomes the tag when you publish the draft, which is what the
+# release.yml build workflow keys off (`release: published`).
+#
+# Versioning is label-driven: label a PR `major` / `minor` / `patch` (or one of the
+# category labels below) and the next version bumps accordingly. Default bump is patch.
+name-template: "v$RESOLVED_VERSION"
+tag-template: "v$RESOLVED_VERSION"
+tag-prefix: v
+
+categories:
+    - title: "🚀 Features"
+      labels:
+          - feature
+          - enhancement
+    - title: "🐛 Fixes"
+      labels:
+          - fix
+          - bug
+    - title: "🧹 Maintenance"
+      labels:
+          - chore
+          - maintenance
+          - refactor
+          - dependencies
+    - title: "📖 Documentation"
+      labels:
+          - docs
+          - documentation
+
+exclude-labels:
+    - skip-changelog
+    - no-release-notes
+
+change-template: "- $TITLE (#$NUMBER) @$AUTHOR"
+change-title-escapes: '\<*_&' # backslash escapes markdown
+
+version-resolver:
+    major:
+        labels:
+            - major
+            - breaking
+    minor:
+        labels:
+            - minor
+            - feature
+            - enhancement
+    patch:
+        labels:
+            - patch
+            - fix
+            - bug
+            - chore
+            - maintenance
+            - refactor
+            - dependencies
+            - docs
+            - documentation
+    default: patch
+
+# Auto-label PRs by branch name / title so contributors don't have to remember to add
+# labels for the version resolver to work.
+autolabeler:
+    - label: docs
+      files:
+          - "docs/**/*"
+          - "**/*.md"
+    - label: fix
+      branch:
+          - '/^fix\/.+/'
+      title:
+          - '/^fix(\(.+\))?:/i'
+    - label: feature
+      branch:
+          - '/^feat\/.+/'
+      title:
+          - '/^feat(\(.+\))?:/i'
+    - label: chore
+      branch:
+          - '/^chore\/.+/'
+      title:
+          - '/^chore(\(.+\))?:/i'
+
+template: |
+    ## What's Changed
+
+    $CHANGES
+
+    **Full Changelog**: https://github.com/$OWNER/$REPOSITORY/compare/$PREVIOUS_TAG...v$RESOLVED_VERSION
