@@ -11,12 +11,13 @@
 #   make release      bundle + Developer ID sign + notarize + staple (ship build)
 #   make sign         bundle + Developer ID sign only (no notarize)
 #   make wavesrv      rebuild the bundled Go server (bin/wavesrv.arm64)
+#   make fetch-wavesrv download wavesrv + wsh from the release pinned in WAVESRV_VERSION
 #   make run          debug build + bundle + open
 #   make testapp      side-by-side TEST build (WaveNativeTest.app, isolated settings dir), run it
 #   make testbundle   the same TEST build without launching it
 #   make clean        remove dist/ and .build/
 
-.PHONY: app bundle release sign wavesrv run dev testapp testbundle clean
+.PHONY: app bundle release sign wavesrv fetch-wavesrv run dev testapp testbundle clean
 
 SWIFT_FLAGS := -Xcc -Ivendor/libghostty/include -Xlinker -Lvendor/libghostty/lib
 PARENT := $(abspath ..)
@@ -25,7 +26,7 @@ WAVESRV_MAIN := $(PARENT)/cmd/server/main-server.go
 # Release-flow bundles rebuild the bundled Go server first — bundle-app.sh copies
 # bin/wavesrv.arm64 in as Resources/wavesrv, so a stale binary ships silently
 # otherwise. Only when this checkout actually lives inside the wavesrv repo; a
-# standalone wave-native checkout keeps the prebuilt bin.
+# standalone wave-native checkout keeps the prebuilt bin (make fetch-wavesrv).
 ifneq (,$(wildcard $(WAVESRV_MAIN)))
 BUNDLE_DEPS := wavesrv
 endif
@@ -82,6 +83,11 @@ wavesrv:
 	cd $(PARENT) && CGO_ENABLED=1 GOARCH=arm64 go build \
 		-tags "osusergo,sqlite_omit_load_extension" \
 		-o wave-native/bin/wavesrv.arm64 cmd/server/main-server.go
+
+# Prebuilt wavesrv + wsh from the thoro/wavesrv release in WAVESRV_VERSION (what the
+# release CI bundles); replaces bin/wavesrv.arm64 and every bin/wsh-*.
+fetch-wavesrv:
+	./scripts/fetch-wavesrv.sh
 
 # Rebuild the wsh binaries: darwin.arm64 backs local durable shells (the "wsh
 # jobmanager" daemon); the other platforms are what wavesrv copies to remote SSH

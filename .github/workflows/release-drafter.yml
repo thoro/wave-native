@@ -1,0 +1,27 @@
+# Keeps a single DRAFT GitHub Release up to date with categorized notes and the
+# resolved next version (see .github/release-drafter.yml). On every push to main it
+# recomputes; on PRs it just autolabels (so the version resolver has labels to work
+# with). Publishing the drafted release creates the tag and triggers release.yml.
+name: Release Drafter
+on:
+    push:
+        branches:
+            - main
+    pull_request:
+        types: [opened, reopened, synchronize]
+
+permissions:
+    contents: read
+
+jobs:
+    update-draft:
+        permissions:
+            contents: write # create/update the draft release
+            pull-requests: write # apply autolabels
+        runs-on: ubuntu-latest
+        steps:
+            - uses: release-drafter/release-drafter@v7
+              with:
+                  config-name: release-drafter.yml
+              env:
+                  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -59,17 +59,24 @@ cp -R "$GHOSTTY_DIR"/zig-out/include/ghostty "$VENDOR/libghostty/include/"
 git -C "$GHOSTTY_DIR" rev-parse HEAD > "$VENDOR/libghostty/GHOSTTY_REV.txt"
 
 # --- 3. wavesrv --------------------------------------------------------------
-echo "==> building wavesrv (CGO, sqlite) -> $NATIVE_DIR/bin/wavesrv.arm64"
-( cd "$REPO_ROOT" && CGO_ENABLED=1 GOARCH=arm64 \
-  go build -tags "osusergo,sqlite_omit_load_extension" \
-  -o "$NATIVE_DIR/bin/wavesrv.arm64" cmd/server/main-server.go )
+# A standalone checkout has no Go source to build from: fetch the pinned release
+# (wavesrv + wsh) instead and skip 3b.
+if [ ! -f "$REPO_ROOT/cmd/server/main-server.go" ]; then
+  echo "==> no wavesrv checkout at $REPO_ROOT — fetching the release in WAVESRV_VERSION"
+  "$NATIVE_DIR/scripts/fetch-wavesrv.sh"
+else
+  echo "==> building wavesrv (CGO, sqlite) -> $NATIVE_DIR/bin/wavesrv.arm64"
+  ( cd "$REPO_ROOT" && CGO_ENABLED=1 GOARCH=arm64 \
+    go build -tags "osusergo,sqlite_omit_load_extension" \
+    -o "$NATIVE_DIR/bin/wavesrv.arm64" cmd/server/main-server.go )
 
-# --- 3b. wsh -----------------------------------------------------------------
-# Durable shells exec a detached "wsh jobmanager" daemon that holds the local PTY
-# so it survives a wavesrv restart, and wavesrv installs wsh onto remote SSH
-# hosts. build-wsh.sh cross-compiles every supported os/arch into bin/
-# (wavesrv resolves them under $WAVETERM_APP_PATH/bin; cwd-relative in dev runs).
-"$NATIVE_DIR/scripts/build-wsh.sh"
+  # --- 3b. wsh -----------------------------------------------------------------
+  # Durable shells exec a detached "wsh jobmanager" daemon that holds the local PTY
+  # so it survives a wavesrv restart, and wavesrv installs wsh onto remote SSH
+  # hosts. build-wsh.sh cross-compiles every supported os/arch into bin/
+  # (wavesrv resolves them under $WAVETERM_APP_PATH/bin; cwd-relative in dev runs).
+  "$NATIVE_DIR/scripts/build-wsh.sh"
+fi
 
 # --- 4. fonts ----------------------------------------------------------------
 FONTS="$NATIVE_DIR/Fonts"

@@ -58,6 +58,25 @@ wave-native/
    contract before any UI.
 3. Then terminal (libghostty) → layout → web → chrome, per `docs/ROADMAP.md`.
 
+## wavesrv and releases
+
+The backend comes from [thoro/wavesrv](https://github.com/thoro/wavesrv). A
+standalone checkout gets its prebuilt `wavesrv` + `wsh` binaries from the
+release pinned in `WAVESRV_VERSION`:
+
+```
+make fetch-wavesrv   # -> bin/wavesrv.arm64 + bin/wsh-<version>-*
+make bundle          # -> dist/WaveNative.app
+```
+
+When this checkout sits inside a wavesrv checkout (`../cmd/server` exists),
+`make wavesrv` and `scripts/build-wsh.sh` build them from source instead.
+
+Releases are built by `.github/workflows/release.yml`: publishing the drafted
+GitHub release fetches the pinned wavesrv, bundles, signs and notarizes the app,
+and attaches `WaveNative-<version>-macos-arm64.zip`. To ship a newer backend,
+bump `WAVESRV_VERSION` in a PR first.
+
 ## Diagnosing a running instance
 
 An invisible view that swallows clicks (a pane frame parked at a stale magnify
